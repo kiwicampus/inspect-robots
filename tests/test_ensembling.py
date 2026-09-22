@@ -96,6 +96,20 @@ def test_accepts_joint_delta_semantics() -> None:
     EnsemblingController(Box(shape=(2,), semantics=ActionSemantics("joint_delta")))
 
 
+def test_accepts_base_velocity_semantics() -> None:
+    # base_velocity (mobile-base [linear, angular] rate command) is a flat
+    # vector with no rotation representation, so it is just as linearly
+    # averageable as joint_vel; the constructor must not refuse it.
+    EnsemblingController(
+        Box(
+            shape=(2,),
+            semantics=ActionSemantics(
+                "base_velocity", dim_labels=("linear_x", "angular_z")
+            ),
+        )
+    )
+
+
 def test_warns_when_semantics_missing() -> None:
     with pytest.warns(RuntimeWarning, match="no semantics"):
         EnsemblingController(Box(shape=(2,)))

@@ -331,6 +331,7 @@ the compatibility check without extra configuration.
 | [SO-ARM](https://github.com/TheRobotStudio/SO-ARM100) followers (SO-100 / SO-101) | `so_arm` | [inspect-robots-so101](https://github.com/robocurve/inspect-robots-so101) | 6-D `joint_pos` | `lerobot` |
 | WidowX 250S | `widowx` | [inspect-robots-widowx](https://github.com/robocurve/inspect-robots-widowx) | 7-D `eef_delta_pose` | `openvla`, `openpi` |
 | Any ROS 1 or ROS 2 arm through rosbridge | `ros` | [inspect-robots-ros](plugins/inspect-robots-ros/) | `joint_pos`, width set by the joints you list | — |
+| Mobile ground robot over rosboard | `rosboard` | [inspect-robots-rosboard](plugins/inspect-robots-rosboard/) | 2-D `base_velocity` (`linear_x`, `angular_z`) | — |
 
 Trossen discontinued the WidowX 250S in July 2025. That adapter supports
 existing 250S rigs; the successor WidowX AI uses a different stack.
@@ -392,6 +393,10 @@ shipped from this repo as separate packages:
 - **[inspect-robots-ros](plugins/inspect-robots-ros/)**: run evals on ROS 1 or
   ROS 2 arms through rosbridge, with no ROS installation on the eval machine
   (`--embodiment ros`).
+- **[inspect-robots-rosboard](plugins/inspect-robots-rosboard/)**: run evals
+  against a real mobile ground robot over its
+  [rosboard](https://github.com/dheera/rosboard) websocket, again with no ROS
+  installation on the eval machine (`--embodiment rosboard`).
 - **[inspect-robots-isaacsim](plugins/inspect-robots-isaacsim/)**: run evals
   against an [Isaac Lab](https://isaac-sim.github.io/IsaacLab/) simulation
   (`--embodiment isaacsim`).
@@ -449,6 +454,26 @@ evaluate any XPolicyLab-served VLA on the same arm; the `-E` robot arguments
 stay unchanged. Robot bringup, controller mappings, safety requirements,
 camera configuration, and reset behavior are documented in the
 [ROS plugin README](plugins/inspect-robots-ros/).
+
+### Real robots via Rosboard
+
+The rosboard embodiment connects to a real mobile ground robot's
+[rosboard](https://github.com/dheera/rosboard) websocket server. It publishes
+a `[linear_x, angular_z]` base-velocity command at a configured control rate,
+hard-clamped inside `step()` independent of the framework's own guardrails,
+since it drives a real moving vehicle.
+
+```bash
+uv pip install inspect-robots-rosboard
+
+inspect-robots run --task my-nav-task --policy scripted --embodiment rosboard \
+    -E url=ws://robot.example.com:80 \
+    -E camera_height=480 -E camera_width=640
+```
+
+Robot bringup, the full `-E` configuration table, safety requirements, and
+reset behavior are documented in the
+[Rosboard plugin README](plugins/inspect-robots-rosboard/).
 
 Safety guardrails (a bounds clamp plus a per-step delta limit derived from
 the embodiment's action space, followed by any specialized guardrails the
