@@ -404,6 +404,14 @@ shipped from this repo as separate packages:
   any [XPolicyLab](https://github.com/XPolicyLab/XPolicyLab)-served policy.
   One adapter puts its zoo of 40+ VLAs (π0/π0.5, GR00T, OpenVLA-OFT, RDT-1B,
   SmolVLA, ACT, …) behind `--policy xpolicylab -P url=ws://gpu-box:19000`.
+- **[inspect-robots-lerobot](plugins/inspect-robots-lerobot/)**: run a locally
+  loaded [LeRobot](https://github.com/huggingface/lerobot) checkpoint (ACT,
+  Diffusion Policy, SmolVLA, …) as `--policy lerobot -P checkpoint=...`,
+  in-process, with no inference server.
+- **[inspect-robots-pi-server](plugins/inspect-robots-pi-server/)**: drive a
+  checkpoint served over the PI protocol (`pi_inference_client`'s wire
+  format, e.g. a `policy_server`/Modal deployment) as
+  `--policy pi_server -P url=wss://...`.
 - **[inspect-robots-agent](plugins/inspect-robots-agent/)**: let a frontier
   LLM (Claude, GPT, anything behind an OpenAI-compatible API) drive any
   embodiment through tool calls, as a first-class policy. The same

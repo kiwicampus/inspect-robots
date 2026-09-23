@@ -1,0 +1,92 @@
+[build-system]
+requires = ["hatchling>=1.18", "hatch-fancy-pypi-readme>=24.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inspect-robots-lerobot"
+version = "0.1.0"
+description = "LeRobot policy adapter for Inspect Robots: run a locally loaded LeRobot checkpoint (ACT, Diffusion Policy, SmolVLA, ...) as a Policy, in-process, with no inference server."
+dynamic = ["readme"]
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Inspect Robots contributors" }]
+keywords = ["robotics", "lerobot", "vla", "policy", "inspect_robots", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# `lerobot` itself is the real dependency here (it pulls in torch); unlike the
+# xpolicylab/ros/rosboard plugins, this adapter's entire point is to run a
+# checkpoint in-process, so there is no lighter "speak the protocol" option.
+dependencies = [
+    "inspect-robots>=0.44",
+    "numpy>=1.24",
+    "lerobot>=0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "mypy>=1.11", "ruff>=0.6"]
+
+[project.entry-points."inspect_robots.policies"]
+lerobot = "inspect_robots_lerobot:lerobot_policy"
+
+[project.urls]
+Homepage = "https://github.com/robocurve/inspect-robots/tree/main/plugins/inspect-robots-lerobot"
+Repository = "https://github.com/robocurve/inspect-robots"
+
+[tool.uv.sources]
+inspect-robots = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inspect_robots_lerobot"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/inspect_robots_lerobot", "tests", "README.md"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.isort]
+known-first-party = ["inspect_robots", "inspect_robots_lerobot"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]
+
+[tool.mypy]
+strict = true
+
+# lerobot ships no py.typed marker / type stubs; inspect_robots_rosboard (used
+# only in a cross-plugin compatibility test) does not ship one either.
+[[tool.mypy.overrides]]
+module = ["lerobot.*", "inspect_robots_rosboard.*"]
+ignore_missing_imports = true
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!NOTE\][ \t]*$'
+replacement = '> **Note:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!TIP\][ \t]*$'
+replacement = '> **Tip:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!IMPORTANT\][ \t]*$'
+replacement = '> **Important:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!WARNING\][ \t]*$'
+replacement = '> **Warning:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!CAUTION\][ \t]*$'
+replacement = '> **Caution:**'
