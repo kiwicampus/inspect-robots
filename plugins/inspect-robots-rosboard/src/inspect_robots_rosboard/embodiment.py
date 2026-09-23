@@ -26,6 +26,20 @@ These two paths are independent implementations sharing only the low-level
 ``RosboardClient`` and the generic staleness/sequence-wait helpers: the fixed
 schema is untouched by the config path so its existing behavior and tests
 stay exactly as they were before config support was added.
+
+Independently of the above, either mode additionally accepts ``-E
+topics_file=path/to/topics_to_subscribe.yaml``, the ROS2 ``rosboard_client``
+node's own config file, parsed by :mod:`inspect_robots_rosboard._topics_file`.
+This makes that file the source of truth for the rosboard ``url`` and for
+whether each subscribed/published topic (the fixed schema's four roles, or
+every ``observations[]``/``actions[]`` topic in a ``config`` file) is
+actually active, without adding a ROS dependency: the file is read once, at
+construction, as plain YAML. In particular, whether a command topic appears
+in the file's ``topics_to_stream:`` list decides, once, whether ``step()``
+publishes a real command on that topic or only logs what it would have sent
+(a dry run) -- independently per ``actions[]`` entry in config-driven mode.
+Toggling this requires editing the file and starting a new run, not mid-run:
+it is read once, not re-checked on every ``step()``.
 """
 
 from __future__ import annotations
@@ -55,7 +69,12 @@ from inspect_robots import (
 )
 from inspect_robots.embodiment import SELF_PACED
 from inspect_robots_rosboard._client import RosboardClient, TopicSample
-from inspect_robots_rosboard._config import ObservationSpec, RobotConfig, load_robot_config
+from inspect_robots_rosboard._config import (
+    ActionSpec,
+    ObservationSpec,
+    RobotConfig,
+    load_robot_config,
+)
 from inspect_robots_rosboard._msgs import (
     build_twist,
     parse_compressed_image,
@@ -63,8 +82,14 @@ from inspect_robots_rosboard._msgs import (
     parse_odometry,
 )
 from inspect_robots_rosboard._selectors import build_from_selector, select_state
+from inspect_robots_rosboard._topics_file import TopicsFile, load_topics_file
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
+
+
+def _dry_run_action_topics(actions: tuple[ActionSpec, ...], enabled: tuple[bool, ...]) -> list[str]:
+    """The publish topics of every ``actions[]`` entry not armed by ``topics_file``."""
+    return [a.publish_topic for a, e in zip(actions, enabled, strict=True) if not e]
 
 
 class RosboardEmbodiment(EmbodimentBase):
@@ -74,6 +99,7 @@ class RosboardEmbodiment(EmbodimentBase):
         self,
         *,
         config: str | None = None,
+        topics_file: str | None = None,
         url: str = "ws://localhost:8888",
         odometry_topic: str = "/odometry/local",
         imu_topic: str = "/imu/data_abs_heading",
@@ -94,15 +120,34 @@ class RosboardEmbodiment(EmbodimentBase):
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        resolved_url = url
+        topics_cfg: TopicsFile | None = None
+        if topics_file is not None:
+            if url != "ws://localhost:8888":
+                raise ValueError(
+                    "topics_file and url are mutually exclusive; the rosboard url is "
+                    "read from topics_file's 'url:' field, so drop -E url= when using "
+                    "-E topics_file="
+                )
+            topics_cfg = load_topics_file(topics_file)
+            resolved_url = topics_cfg.url
+
         if config is not None:
             # Config-driven mode: the YAML file is the sole source of topic
             # wiring, action clamps, and control rate. Every fixed-schema
             # argument above (odometry_topic, camera_*, *_limit, control_hz,
             # fresh_obs_timeout_s, staleness_s) is ignored here; only the
-            # generic connection/runtime args below still apply.
+            # generic connection/runtime args below still apply. ``topics_file``
+            # composes with ``config``: it still sources ``url`` and still
+            # gates which of the config file's observations[]/actions[]
+            # topics are actually subscribed/published, same as fixed-schema
+            # mode, just checked per config-file topic instead of per fixed
+            # role.
             self._init_from_config(
                 config,
-                url=url,
+                url=resolved_url,
+                topics_file=topics_file,
+                topics_cfg=topics_cfg,
                 obs_timeout_s=obs_timeout_s,
                 simulated=simulated,
                 name=name,
@@ -111,6 +156,22 @@ class RosboardEmbodiment(EmbodimentBase):
                 sleep=sleep,
             )
             return
+
+        publish_enabled = True
+        if topics_cfg is not None:
+            for role_arg, topic in (
+                ("odometry_topic", odometry_topic),
+                ("imu_topic", imu_topic),
+                ("camera_topic", camera_topic),
+            ):
+                if topic not in topics_cfg.topics:
+                    raise ValueError(
+                        f"topics_file {topics_file!r} does not list {role_arg}={topic!r} "
+                        "under 'topics:'; uncomment or add it there to subscribe to it, "
+                        f"or pass a different -E {role_arg}="
+                    )
+            publish_enabled = command_topic in topics_cfg.topics_to_stream
+
         if camera_height is None or camera_width is None:
             raise ValueError(
                 "camera_height and camera_width are required; rosboard performs no "
@@ -184,10 +245,17 @@ class RosboardEmbodiment(EmbodimentBase):
                 "acceleration m/s^2). No absolute-mode proprioceptive reference is "
                 "declared because base_velocity is a rate command, not an absolute "
                 f"target. Camera is a single forward-facing RGB stream ('{camera_name}')."
+                + (
+                    f" DRY RUN: topics_file={topics_file!r} does not list "
+                    f"{command_topic!r} under topics_to_stream:, so step() logs the "
+                    "would-be command instead of publishing it."
+                    if topics_file is not None and not publish_enabled
+                    else ""
+                )
             ),
         )
 
-        self.url = url
+        self.url = resolved_url
         self.odometry_topic = odometry_topic
         self.imu_topic = imu_topic
         self.camera_topic = camera_topic
@@ -204,8 +272,9 @@ class RosboardEmbodiment(EmbodimentBase):
         self._clock = clock
         self._sleep = sleep
         self._client = RosboardClient(
-            url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
+            resolved_url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
         )
+        self._publish_enabled = publish_enabled
         self._initialized = False
         self._instruction: str | None = None
         self._last_publish_time: float | None = None
@@ -261,7 +330,15 @@ class RosboardEmbodiment(EmbodimentBase):
 
         seq_at_publish = self._client.sequence(self.odometry_topic)
         publish_time = self._clock()
-        self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(linear_x, angular_z))
+        if self._publish_enabled:
+            self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(linear_x, angular_z))
+        else:
+            print(
+                f"[rosboard dry-run] {self.command_topic!r} is not listed under "
+                "topics_to_stream: in the configured topics_file; would publish "
+                f"linear_x={linear_x:g} angular_z={angular_z:g} but sent nothing",
+                file=sys.stderr,
+            )
         self._last_publish_time = publish_time
 
         try:
@@ -294,7 +371,7 @@ class RosboardEmbodiment(EmbodimentBase):
         if self._robot_config is not None:
             self._close_config()
             return
-        if self._initialized:
+        if self._initialized and self._publish_enabled:
             with suppress(Exception):
                 self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(0.0, 0.0))
         self._client.close()
@@ -407,6 +484,8 @@ class RosboardEmbodiment(EmbodimentBase):
         config_path: str,
         *,
         url: str,
+        topics_file: str | None,
+        topics_cfg: TopicsFile | None,
         obs_timeout_s: float,
         simulated: bool,
         name: str,
@@ -422,6 +501,20 @@ class RosboardEmbodiment(EmbodimentBase):
             )
 
         robot_config = load_robot_config(config_path)
+
+        if topics_cfg is not None:
+            for spec in robot_config.observations:
+                if spec.topic not in topics_cfg.topics:
+                    raise ValueError(
+                        f"topics_file {topics_file!r} does not list observation "
+                        f"{spec.key!r}'s topic {spec.topic!r} under 'topics:'; uncomment "
+                        "or add it there to subscribe to it"
+                    )
+
+        action_publish_enabled = tuple(
+            topics_cfg is None or action_spec.publish_topic in topics_cfg.topics_to_stream
+            for action_spec in robot_config.actions
+        )
 
         cameras = tuple(
             CameraSpec(spec.key, spec.image.height, spec.image.width)
@@ -472,6 +565,14 @@ class RosboardEmbodiment(EmbodimentBase):
                 "concatenation, in config file order, of each actions[] entry's "
                 f"selector.names: {action_dims!r}, each independently hard-clamped "
                 "to its own from_tensor.clamp inside step()."
+                + (
+                    f" DRY RUN: topics_file={topics_file!r} does not list "
+                    f"{_dry_run_action_topics(robot_config.actions, action_publish_enabled)!r} "
+                    "under topics_to_stream:, so step() logs the would-be command for "
+                    "those actions instead of publishing it."
+                    if topics_cfg is not None and not all(action_publish_enabled)
+                    else ""
+                )
             ),
         )
 
@@ -484,6 +585,7 @@ class RosboardEmbodiment(EmbodimentBase):
         self._client = RosboardClient(
             url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
         )
+        self._action_publish_enabled = action_publish_enabled
         self._robot_config = robot_config
         self._initialized = False
         self._instruction = None
@@ -532,14 +634,26 @@ class RosboardEmbodiment(EmbodimentBase):
         publish_time = self._clock()
 
         offset = 0
-        for action_spec in self._robot_config.actions:
+        for action_spec, enabled in zip(
+            self._robot_config.actions, self._action_publish_enabled, strict=True
+        ):
             n = len(action_spec.selector_names)
             clamped = np.clip(
                 data[offset : offset + n], action_spec.clamp_low, action_spec.clamp_high
             )
             offset += n
-            fields = build_from_selector(action_spec.selector_names, clamped.tolist())
-            self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
+            names = action_spec.selector_names + action_spec.zero_fields
+            values = [*clamped.tolist(), *([0.0] * len(action_spec.zero_fields))]
+            fields = build_from_selector(names, values)
+            if enabled:
+                self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
+            else:
+                print(
+                    f"[rosboard dry-run] {action_spec.publish_topic!r} is not listed "
+                    "under topics_to_stream: in the configured topics_file; would "
+                    f"publish {fields!r} but sent nothing",
+                    file=sys.stderr,
+                )
         self._last_publish_time = publish_time
 
         try:
@@ -563,12 +677,15 @@ class RosboardEmbodiment(EmbodimentBase):
     def _close_config(self) -> None:
         assert self._robot_config is not None
         if self._initialized:
-            for action_spec in self._robot_config.actions:
-                if action_spec.safety_behavior != "zeros":
+            for action_spec, enabled in zip(
+                self._robot_config.actions, self._action_publish_enabled, strict=True
+            ):
+                if action_spec.safety_behavior != "zeros" or not enabled:
                     continue
-                zeros = [0.0] * len(action_spec.selector_names)
+                names = action_spec.selector_names + action_spec.zero_fields
+                zeros = [0.0] * len(names)
                 with suppress(Exception):
-                    fields = build_from_selector(action_spec.selector_names, zeros)
+                    fields = build_from_selector(names, zeros)
                     self._client.publish(
                         action_spec.publish_topic, action_spec.publish_type, fields
                     )

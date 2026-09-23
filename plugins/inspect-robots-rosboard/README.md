@@ -17,6 +17,11 @@
   first runs.
 - `close()` publishes a zero-velocity stop command before disconnecting, but
   that is a best-effort courtesy, not a substitute for a real e-stop.
+- To rehearse a full policy+embodiment run risk-free before arming it, use
+  `-E topics_file=topics_to_subscribe.yaml` with the command topic commented
+  out: the loop runs end to end (observations, inference, clamping) but
+  `step()`/`close()` log what they would have published instead of sending
+  it. See "Sourcing topics from `topics_to_subscribe.yaml`" below.
 
 The package registers the `rosboard` Inspect Robots embodiment. It connects
 directly to a running rosboard server (dheera/rosboard) over its own websocket
@@ -69,7 +74,8 @@ Pass values as `-E key=value` arguments or as keyword arguments to
 
 | Argument | Default | Meaning |
 | --- | --- | --- |
-| `url` | `ws://localhost:8888` | rosboard websocket host. `/rosboard/v1` is appended automatically. |
+| `url` | `ws://localhost:8888` | rosboard websocket host. `/rosboard/v1` is appended automatically. Mutually exclusive with `topics_file` (see below), which sources it from the file instead. |
+| `topics_file` | none | Path to a ROS2 `rosboard_client`-style `topics_to_subscribe.yaml`; sources `url` and gates topic subscribe/publish from that file. See "Sourcing topics from `topics_to_subscribe.yaml`" below. |
 | `odometry_topic` | `/odometry/local` | `nav_msgs/msg/Odometry` source; also the step-freshness reference. |
 | `imu_topic` | `/imu/data_abs_heading` | `sensor_msgs/msg/Imu` source. |
 | `camera_topic` | `/camera/color/image_raw` | Image source; rosboard compresses it to JPEG server-side regardless of the underlying ROS type. |
@@ -90,6 +96,46 @@ Pass values as `-E key=value` arguments or as keyword arguments to
 There is no `-E` for the command topic's message type: it is always
 `geometry_msgs/msg/Twist`, and only `linear.x`/`angular.z` are ever set (the
 remaining four degrees of freedom are sent as zero).
+
+## Sourcing topics from `topics_to_subscribe.yaml` (`-E topics_file=...`)
+
+If a robot already has a ROS2 `rosboard_client` node config
+(`topics_to_subscribe.yaml`: `url`, `topics: [...]`, `topics_to_stream:
+[...]`), pass it directly instead of duplicating the topic names as separate
+`-E` args:
+
+```bash
+inspect-robots run --task my-nav-task --policy scripted --embodiment rosboard \
+    -E topics_file=topics_to_subscribe.yaml \
+    -E camera_height=480 -E camera_width=640
+```
+
+This is still the fixed odometry/IMU/camera/Twist schema above (field
+semantics, clamps, and camera dimensions still come from the usual `-E`
+args); `topics_file` only sources two things from the file, once, at
+construction:
+
+- **`url`**: read from the file's `url:` key. Passing `-E url=` at the same
+  time as `topics_file` raises, since the two would conflict.
+- **Whether each role topic is actually subscribed or published**, by
+  checking that topic's presence in the file's `topics:`/`topics_to_stream:`
+  lists (a commented-out entry inside the YAML flow sequence, e.g. `#
+  /foo/bar,`, is simply absent from the parsed list, exactly like today for
+  the ROS2 node). `odometry_topic`/`imu_topic`/`camera_topic` (their usual
+  defaults or `-E` overrides) must each appear in `topics:`, or construction
+  raises naming the missing one. `command_topic`'s presence in
+  `topics_to_stream:` is **not** required the same way: if it's absent
+  (commented out, as it is by default in a freshly cloned
+  `topics_to_subscribe.yaml`), `step()` computes and clamps the action as
+  normal but does not publish it, logging what it would have sent to stderr
+  instead ("dry run"). `close()`'s courtesy zero-velocity stop is skipped the
+  same way. This gives you a single-file switch for whether an eval can
+  actually move the robot: uncomment the command topic in
+  `topics_to_subscribe.yaml` to arm it, leave it commented to rehearse a
+  policy risk-free.
+
+This check happens once, at construction, not on every `step()`: to flip
+between dry-run and armed, edit the file and start a new run.
 
 ## Configuration file (`-E config=...`)
 

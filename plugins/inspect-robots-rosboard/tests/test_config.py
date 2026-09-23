@@ -195,6 +195,41 @@ def test_load_robot_config_rejects_unsupported_safety_behavior(tmp_path: Path) -
         load_robot_config(_write_config(tmp_path, text))
 
 
+def test_load_robot_config_action_zero_fields_defaults_empty(tmp_path: Path) -> None:
+    config = load_robot_config(_write_config(tmp_path))
+    assert config.actions[0].zero_fields == ()
+
+
+def test_load_robot_config_parses_action_zero_fields(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace(
+        "    from_tensor:", "    zero_fields: [twist.linear.y, twist.linear.z]\n    from_tensor:"
+    )
+    config = load_robot_config(_write_config(tmp_path, text))
+    assert config.actions[0].zero_fields == ("twist.linear.y", "twist.linear.z")
+
+
+def test_load_robot_config_rejects_non_list_zero_fields(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace(
+        "    from_tensor:", "    zero_fields: not-a-list\n    from_tensor:"
+    )
+    with pytest.raises(ConfigError, match="zero_fields must be a list of strings"):
+        load_robot_config(_write_config(tmp_path, text))
+
+
+def test_load_robot_config_rejects_non_string_zero_fields_entries(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace("    from_tensor:", "    zero_fields: [1]\n    from_tensor:")
+    with pytest.raises(ConfigError, match="zero_fields must be a list of strings"):
+        load_robot_config(_write_config(tmp_path, text))
+
+
+def test_load_robot_config_rejects_zero_fields_overlapping_selector_names(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace(
+        "    from_tensor:", "    zero_fields: [twist.linear.x]\n    from_tensor:"
+    )
+    with pytest.raises(ConfigError, match=r"zero_fields overlaps selector\.names"):
+        load_robot_config(_write_config(tmp_path, text))
+
+
 def test_load_robot_config_rejects_duplicate_observation_keys(tmp_path: Path) -> None:
     text = _MINIMAL_CONFIG.replace("observation.state", "observation.image.main", 1)
     with pytest.raises(ConfigError, match="key values must be unique"):
@@ -282,6 +317,46 @@ def test_config_step_clamps_and_publishes_each_action_spec(tmp_path: Path) -> No
     assert fields == {"twist": {"linear": {"x": 2.0}, "angular": {"z": -2.0}}}
     assert result.terminated is False
     assert result.truncated is False
+
+
+def test_config_step_publishes_zero_fields_alongside_commanded_values(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace(
+        "    from_tensor:",
+        "    zero_fields: [twist.linear.y, twist.linear.z, twist.angular.x, twist.angular.y]\n"
+        "    from_tensor:",
+    )
+    fake_clock = _FakeClock()
+    embodiment = RosboardEmbodiment(
+        config=_write_config(tmp_path, text), clock=fake_clock, sleep=fake_clock.sleep
+    )
+    client = _FakeClient(fake_clock)
+    image = np.zeros((2, 3, 3), dtype=np.uint8)
+    client.put("/camera/color/image_raw", _image_payload(image))
+    client.put(
+        "/odometry/local",
+        {"twist": {"twist": {"linear": {"x": 1.0}, "angular": {"z": 0.5}}}},
+    )
+
+    def fresh(topic: str, _after_seq: int) -> None:
+        if topic in client.samples:
+            client.put(topic, client.samples[topic].payload)
+
+    client.on_wait = fresh
+    embodiment._client = cast(Any, client)
+    embodiment._initialized = True
+    embodiment._instruction = _SCENE.instruction
+
+    embodiment.reset(_SCENE)
+    embodiment.step(Action(data=np.array([10.0, -10.0])))
+
+    topic, _topic_type, fields = client.published[-1]
+    assert topic == "/motion_control/speed_controller/output_cmd"
+    assert fields == {
+        "twist": {
+            "linear": {"x": 2.0, "y": 0.0, "z": 0.0},
+            "angular": {"x": 0.0, "y": 0.0, "z": -2.0},
+        }
+    }
 
 
 def test_config_step_rejects_wrong_action_shape(tmp_path: Path) -> None:

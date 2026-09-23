@@ -74,6 +74,17 @@ class ActionSpec:
     written to inside the outgoing message dict, in order (e.g.
     ``twist.linear.x``); the embodiment's flat action vector is the
     concatenation of every ``ActionSpec``'s dimensions, in file order.
+
+    ``zero_fields`` are additional dotted paths written as a constant ``0.0``
+    on every publish, alongside the ``selector_names`` values, but never part
+    of the commandable action vector. Some message types have fields a real
+    ROS graph silently requires present even when unused (a ``Twist``'s
+    unused five degrees of freedom, for a ground robot only commanding
+    ``linear.x``/``angular.z``): rosboard has no schema to fill these in
+    itself, and a partial message can silently no-op server-side rather than
+    raising (see the plugin README's Troubleshooting section), so an
+    incomplete config for a message type that needs this is a real, silent
+    footgun, not just an omission.
     """
 
     key: str
@@ -83,6 +94,7 @@ class ActionSpec:
     clamp_low: float
     clamp_high: float
     safety_behavior: str
+    zero_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -223,6 +235,19 @@ def _parse_action(entry: Any, path: str) -> ActionSpec:
             f"only {sorted(_SUPPORTED_SAFETY_BEHAVIORS)} (publishes on close())"
         )
 
+    zero_fields_raw = entry.get("zero_fields", [])
+    if not isinstance(zero_fields_raw, list) or not all(
+        isinstance(n, str) and n for n in zero_fields_raw
+    ):
+        raise ConfigError(f"{path!r}: action {key!r}: zero_fields must be a list of strings")
+    zero_fields = tuple(zero_fields_raw)
+    overlap = set(names) & set(zero_fields)
+    if overlap:
+        raise ConfigError(
+            f"{path!r}: action {key!r}: zero_fields overlaps selector.names: "
+            f"{sorted(overlap)}; a field is either commanded or a constant zero, not both"
+        )
+
     return ActionSpec(
         key=key,
         publish_topic=publish_topic,
@@ -231,6 +256,7 @@ def _parse_action(entry: Any, path: str) -> ActionSpec:
         clamp_low=clamp_low,
         clamp_high=clamp_high,
         safety_behavior=safety_behavior,
+        zero_fields=zero_fields,
     )
 
 
