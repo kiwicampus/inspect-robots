@@ -12,10 +12,13 @@ from inspect_robots.mock import CubePickEmbodiment, NoopPolicy, RandomPolicy, Sc
 from inspect_robots.registry import embodiment, grader, policy, scorer, sink, task
 from inspect_robots.scene import Scene
 from inspect_robots.scorer import (
+    distance_to_goal,
     episode_length,
     min_distance_to_goal,
     operator_scorer,
     reached_goal_state,
+    sct,
+    spl,
     success_at_end,
 )
 from inspect_robots.task import Task
@@ -34,6 +37,9 @@ scorer("episode_length")(episode_length)
 scorer("min_distance_to_goal")(min_distance_to_goal)
 scorer("reached_goal_state")(reached_goal_state)
 scorer("operator")(operator_scorer)
+scorer("distance_to_goal")(distance_to_goal)
+scorer("spl")(spl)
+scorer("sct")(sct)
 
 # Graders
 grader("operator")(operator_grader)

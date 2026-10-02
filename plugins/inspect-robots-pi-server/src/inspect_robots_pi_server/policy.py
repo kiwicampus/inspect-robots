@@ -33,10 +33,13 @@ non-goal — see the README's Configuration section.
 from __future__ import annotations
 
 import atexit
+import json
 import os
+import sys
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -118,6 +121,9 @@ class PiServerPolicy:
         camera_width: int | None = None,
         control_hz: float | None = None,
         prompt: str | None = None,
+        extra: Mapping[str, str] | str | None = None,
+        extra_state: Mapping[str, str] | str | None = None,
+        send_target: bool = False,
         name: str = "pi_server",
         api_key_env: str = "PI_SERVER_API_KEY",
         env: Mapping[str, str] | None = None,
@@ -125,6 +131,7 @@ class PiServerPolicy:
         connect_max_retries: int = 3,
         request_timeout_s: float = 120.0,
         jpeg_quality: int = 85,
+        debug_log: str | None = None,
     ) -> None:
         if action_dim < 1:
             raise ValueError(f"action_dim must be >= 1, got {action_dim!r}")
@@ -141,7 +148,26 @@ class PiServerPolicy:
         self._state_map = _as_mapping(state_map, "state_map")
         self._action_keys_override = _as_str_tuple(action_keys)
         self._prompt = prompt
+        # Sent verbatim as the request's free-form `extra` dict on every infer;
+        # e.g. `modality:language` picks an OmniVLA deployment's mode per run.
+        self._extra = _as_mapping(extra, "extra") or None
+        # `{observation.state key: extra key}`, copied into `extra` on every
+        # infer as plain floats. Unlike `state`, which the protocol carries
+        # as float32 (~0.85 m of longitude at -74), these stay float64.
+        self._extra_state = _as_mapping(extra_state, "extra_state")
+        # Sends the scene's `Target.spec` (e.g. a GPS goal) as `extra["target"]`,
+        # so a goal given once on the task reaches the server unchanged.
+        self._send_target = send_target
+        self._target: dict[str, Any] | None = None
         self._jpeg_quality = jpeg_quality
+        # A per-trial side-car of whatever the server put in InferenceOutputs
+        # .debug (unvalidated, arbitrary-shape diagnostics -- e.g. a VLA's
+        # native waypoint chunk before PD-conversion to a velocity command).
+        # Deliberately not routed through inspect_robots' own action-trace
+        # writer: that's core, numpy-only, 100%-coverage-gated code with a
+        # fixed {"t", "action"} schema; this stays entirely inside the plugin.
+        self._debug_log_path = Path(debug_log) if debug_log else None
+        self._debug_step = 0
 
         semantics = ActionSemantics(
             control_mode=control_mode, rotation_repr=rotation_repr, gripper=gripper, frame=frame
@@ -194,7 +220,15 @@ class PiServerPolicy:
         self._ensure_connected()
         self._client.reset()
         self._instruction = scene.instruction
+        self._target = None
+        if self._send_target:
+            if scene.target is None:
+                raise ConfigError(
+                    f"pi_server policy: send_target is set but scene {scene.id!r} has no target"
+                )
+            self._target = dict(scene.target.spec)
         self._connected_once = True
+        self._debug_step = 0
 
     def act(self, observation: Observation) -> ActionChunk:
         """One inference round trip: build the request, infer, assemble the action chunk."""
@@ -220,6 +254,12 @@ class PiServerPolicy:
             for key in ("server_processing_time_ms", "server_total_time_ms")
             if key in result
         }
+        inner_result = result.get("result")
+        debug = inner_result.get("debug") if isinstance(inner_result, dict) else None
+        if debug:
+            meta["debug"] = debug
+            self._log_debug(debug)
+        self._debug_step += 1
         return ActionChunk(
             actions=actions,
             control_hz=self.info.control_hz,
@@ -248,6 +288,21 @@ class PiServerPolicy:
     def _atexit_close(self) -> None:
         with suppress(Exception):
             self.close()
+
+    def _log_debug(self, debug: dict[str, Any]) -> None:
+        """Append one JSONL line of server-provided diagnostics, if configured.
+
+        Best-effort: a logging failure must not take down a live rollout, so
+        this only ever warns to stderr, never raises.
+        """
+        if self._debug_log_path is None:
+            return
+        try:
+            self._debug_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._debug_log_path.open("a") as f:
+                f.write(json.dumps({"t": self._debug_step, **debug}) + "\n")
+        except OSError as exc:
+            print(f"pi_server policy: failed to write debug_log: {exc}", file=sys.stderr)
 
     def _ensure_connected(self) -> PolicySpec:
         try:
@@ -353,11 +408,25 @@ class PiServerPolicy:
             "inputs": inputs,
             "prefix_info": self._prefix_info,
             "initial_noise": initial_noise,
-            "extra": None,
+            "extra": self._build_extra(observation),
             "return_context": False,
             "timestep_mask": True if "timestep_mask" in spec.input_spec else None,
         }
         return {"inference_input": inference_input, "encode_as_video": False}
+
+    def _build_extra(self, observation: Observation) -> dict[str, Any] | None:
+        extra: dict[str, Any] = dict(self._extra) if self._extra else {}
+        for ir_key, extra_key in self._extra_state.items():
+            if ir_key not in observation.state:
+                raise ConfigError(
+                    f"pi_server policy: observation has no state {ir_key!r} (extra_state -> "
+                    f"{extra_key!r}); available state: {sorted(observation.state)}"
+                )
+            values = np.asarray(observation.state[ir_key], dtype=np.float64).reshape(-1)
+            extra[extra_key] = [float(v) for v in values]
+        if self._target is not None:
+            extra["target"] = dict(self._target)
+        return extra or None
 
     def _assemble_action_chunk(self, payload: dict[str, Any]) -> list[Action]:
         assert self._resolved_for_spec is not None

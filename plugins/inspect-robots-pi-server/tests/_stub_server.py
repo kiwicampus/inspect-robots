@@ -46,6 +46,7 @@ class StubPiServer:
         self.resize_mode = resize_mode
         self.interpolation = interpolation
         self._require_api_key = require_api_key
+        self.debug_payload: dict[str, Any] | None = None
 
         self._lock = threading.RLock()
         self._requests: list[tuple[str, dict[str, Any]]] = []
@@ -144,6 +145,8 @@ class StubPiServer:
             "outputs": outputs,
             "raw_outputs": {"actions": outputs[self.action_keys[0]]},
         }
+        if self.debug_payload is not None:
+            result["debug"] = self.debug_payload
         return {"success": True}, {
             "result": result,
             "server_processing_time_ms": 1.0,

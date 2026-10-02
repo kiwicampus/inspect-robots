@@ -56,12 +56,16 @@ Pass values as `-P key=value` arguments or as keyword arguments to
 | `camera_height` / `camera_width` | `None` | Advisory metadata only (declared once, shared across every camera in `cameras`): `inspect_robots.compat.check_compatibility` checks camera names, not resolution, so this never blocks a real mismatch. The resolution actually used to resize images is whatever the server's `load` response advertises (`image_preprocess`), not this. |
 | `control_hz` | `None` | Declared policy rate; only used for a compatibility warning if it disagrees with the embodiment's (the rollout does not enforce it). |
 | `prompt` | `None` | Fallback task/language string used when `Observation.instruction` is `None`, sent as both `inputs.prompt` and `inputs.robot_task_string`. |
+| `extra` | `None` | `"key:value,..."` sent verbatim as the request's free-form `extra` dict on every `infer` call, for server-specific per-request options the protocol has no field for. An OmniVLA deployment reads `modality` from it to pick the mode per run: `-P extra=modality:language` (also `image`, `gps`, `gps+image`, `language+gps`). A server that doesn't use a key ignores it. |
+| `extra_state` | `None` | `"state_key:extra_key,..."`: on every `infer`, copies `observation.state[state_key]` into `extra[extra_key]` as a list of float64s. Use it for values that the float32 `state` field would round, such as GPS: `-P extra_state=gps:gps,heading:heading_quat`. A missing state key raises. |
+| `send_target` | `false` | Send the scene's `Target.spec` as `extra["target"]` on every `infer`, so a goal set on the task (`-T goal_lat=... -T goal_lon=...`) reaches the server. Raises at `reset` if the scene has no target. |
 | `name` | `pi_server` | Policy name recorded in logs. |
 | `api_key_env` | `PI_SERVER_API_KEY` | The **name** of an environment variable holding the server's API key, never the literal key. `Authorization: Api-Key <value>` is sent on every connect, even if the variable is unset (some deployments sit behind a network-level gate with no per-request check); if the connection then fails, the error names `api_key_env` as a thing to check. |
 | `connect_open_timeout_s` | `360.0` | Websocket handshake timeout, generous by default for a cold-starting serverless GPU container. |
 | `connect_max_retries` | `3` | Connection attempts before giving up, with exponential backoff. Not retried for a malformed `load` response or a timeout. |
 | `request_timeout_s` | `120.0` | Per-RPC (`load`/`infer`/`reset`) timeout. |
 | `jpeg_quality` | `85` | JPEG quality used to encode every camera image before sending. |
+| `debug_log` | none | Path to a JSONL file that gets one `{"t": step, ...}` line per `act()` call whenever the server's response includes an `InferenceOutputs.debug` payload (unvalidated, backend-specific diagnostics -- e.g. a VLA's native waypoint chunk before it collapses to a single velocity command). Absent entirely when the server sends nothing. Failures to write only warn to stderr; they never interrupt a live rollout. |
 
 ## Observation and action contract
 

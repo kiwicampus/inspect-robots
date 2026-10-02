@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,7 +13,7 @@ from _stub_server import StubPiServer
 from inspect_robots.compat import check_compatibility
 from inspect_robots.embodiment import EmbodimentInfo
 from inspect_robots.errors import ConfigError
-from inspect_robots.scene import Scene
+from inspect_robots.scene import Scene, Target
 from inspect_robots.spaces import ActionSemantics, Box, ObservationSpace
 from inspect_robots.types import Observation
 from inspect_robots_pi_server import PiServerPolicy, pi_server_policy
@@ -97,6 +99,50 @@ def test_reset_and_act_returns_action_chunk(stub_server: StubPiServer) -> None:
     policy.close()
 
 
+def test_debug_absent_when_server_sends_none(stub_server: StubPiServer) -> None:
+    policy = _policy(stub_server)
+    policy.reset(_SCENE)
+    chunk = policy.act(_observation())
+    assert "debug" not in chunk.meta
+    policy.close()
+
+
+def test_debug_surfaces_in_meta_and_optional_log(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    stub_server.debug_payload = {"raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
+    debug_log = tmp_path / "debug" / "run.jsonl"
+    policy = _policy(stub_server, debug_log=str(debug_log))
+    policy.reset(_SCENE)
+
+    chunk = policy.act(_observation())
+    assert chunk.meta["debug"] == {"raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
+
+    policy.act(_observation())  # second step, to check the index increments
+
+    lines = debug_log.read_text().splitlines()
+    assert len(lines) == 2
+    first, second = (json.loads(line) for line in lines)
+    assert first == {"t": 0, "raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
+    assert second == {"t": 1, "raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
+    policy.close()
+
+
+def test_debug_log_reset_between_trials(stub_server: StubPiServer, tmp_path: Path) -> None:
+    stub_server.debug_payload = {"raw_waypoints": [[0.0, 0.0, 1.0, 0.0]]}
+    debug_log = tmp_path / "run.jsonl"
+    policy = _policy(stub_server, debug_log=str(debug_log))
+
+    policy.reset(_SCENE)
+    policy.act(_observation())
+    policy.reset(_SCENE)  # a second trial: the step index must restart at 0
+    policy.act(_observation())
+
+    lines = [json.loads(line) for line in debug_log.read_text().splitlines()]
+    assert [entry["t"] for entry in lines] == [0, 0]
+    policy.close()
+
+
 def test_act_before_reset_raises(stub_server: StubPiServer) -> None:
     policy = _policy(stub_server)
     with pytest.raises(RuntimeError, match="before reset"):
@@ -125,6 +171,86 @@ def test_state_key_prefixed_form(stub_server: StubPiServer) -> None:
     policy.act(_observation())
     infer_req = next(r for r in stub_server.requests() if r[0] == "infer")[1]
     assert set(infer_req["inference_input"]["state"]) == {"observation/joint_position"}
+    policy.close()
+
+
+def test_extra_is_none_by_default(stub_server: StubPiServer) -> None:
+    policy = _policy(stub_server)
+    policy.reset(_SCENE)
+    policy.act(_observation())
+    infer_req = next(r for r in stub_server.requests() if r[0] == "infer")[1]
+    assert infer_req["inference_input"]["extra"] is None
+    policy.close()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["modality:language+gps", {"modality": "language+gps"}],
+)
+def test_extra_is_sent_on_every_infer(stub_server: StubPiServer, extra: object) -> None:
+    policy = _policy(stub_server, extra=extra)
+    policy.reset(_SCENE)
+    policy.act(_observation())
+    policy.act(_observation())
+    infers = [r[1] for r in stub_server.requests() if r[0] == "infer"]
+    assert len(infers) == 2
+    assert all(r["inference_input"]["extra"] == {"modality": "language+gps"} for r in infers)
+    policy.close()
+
+
+def test_malformed_extra_raises_at_construction() -> None:
+    with pytest.raises(ValueError, match="extra entry"):
+        PiServerPolicy(
+            url="ws://198.51.100.1:1", control_mode="base_velocity", action_dim=2,
+            extra="modality",
+        )
+
+
+def test_extra_state_is_sent_as_float64_lists(stub_server: StubPiServer) -> None:
+    policy = _policy(stub_server, extra="modality:gps", extra_state="gps:gps")
+    policy.reset(_SCENE)
+    lon = -74.0521123456
+    obs = Observation(
+        images={"front": np.zeros((16, 16, 3), dtype=np.uint8)},
+        state={"odom": np.zeros((4,), dtype=np.float32), "gps": np.array([4.6097123456, lon])},
+    )
+    policy.act(obs)
+    infer_req = next(r for r in stub_server.requests() if r[0] == "infer")[1]
+    assert infer_req["inference_input"]["extra"] == {
+        "modality": "gps",
+        "gps": [4.6097123456, lon],
+    }
+    policy.close()
+
+
+def test_missing_extra_state_key_raises(stub_server: StubPiServer) -> None:
+    policy = _policy(stub_server, extra_state="gps:gps")
+    policy.reset(_SCENE)
+    with pytest.raises(ConfigError, match="extra_state"):
+        policy.act(_observation())
+    policy.close()
+
+
+def test_send_target_sends_the_scene_goal(stub_server: StubPiServer) -> None:
+    scene = Scene(
+        id="wp",
+        instruction="drive",
+        target=Target(kind="reach_goal", spec={"goal_lat": 4.6099, "goal_lon": -74.0519}),
+    )
+    policy = _policy(stub_server, send_target=True)
+    policy.reset(scene)
+    policy.act(_observation())
+    infer_req = next(r for r in stub_server.requests() if r[0] == "infer")[1]
+    assert infer_req["inference_input"]["extra"] == {
+        "target": {"goal_lat": 4.6099, "goal_lon": -74.0519}
+    }
+    policy.close()
+
+
+def test_send_target_without_a_target_raises(stub_server: StubPiServer) -> None:
+    policy = _policy(stub_server, send_target=True)
+    with pytest.raises(ConfigError, match="no target"):
+        policy.reset(_SCENE)
     policy.close()
 
 
