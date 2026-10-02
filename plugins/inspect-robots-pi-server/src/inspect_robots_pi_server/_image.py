@@ -25,6 +25,18 @@ from inspect_robots_pi_server._protocol import PiServerError
 _RESAMPLE = {"bilinear": Image.BILINEAR, "lanczos": Image.LANCZOS}
 
 
+def load_image_file(path: str) -> npt.NDArray[np.uint8]:
+    """Read an image file (any Pillow format) as ``(H, W, 3)`` uint8 RGB.
+
+    Raises ``ValueError`` naming the path when it can't be read or decoded.
+    """
+    try:
+        with Image.open(path) as img:
+            return np.asarray(img.convert("RGB"), dtype=np.uint8).copy()
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"could not read image file {path!r}: {exc}") from exc
+
+
 def validate_image(image: npt.NDArray[np.uint8], label: str) -> None:
     """Confirm ``image`` is a well-formed ``(H, W, 3)`` uint8 array."""
     if not isinstance(image, np.ndarray):

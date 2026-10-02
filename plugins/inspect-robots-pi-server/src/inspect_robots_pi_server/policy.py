@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 
 from inspect_robots import (
     Action,
@@ -61,6 +62,7 @@ from inspect_robots.spaces import ControlMode, Frame, GripperKind, RotationRepr
 from inspect_robots_pi_server._client import PolicyClient
 from inspect_robots_pi_server._image import (
     jpeg_encode,
+    load_image_file,
     resample_for,
     resize_stretch,
     resize_with_pad,
@@ -116,6 +118,7 @@ class PiServerPolicy:
         frame: Frame = "base",
         action_keys: Sequence[str] | str | None = None,
         cameras: Mapping[str, str] | str | None = None,
+        image_files: Mapping[str, str] | str | None = None,
         state_map: Mapping[str, str] | str | None = None,
         camera_height: int | None = None,
         camera_width: int | None = None,
@@ -145,6 +148,17 @@ class PiServerPolicy:
         self._api_key_env = api_key_env
 
         self._cameras = _as_mapping(cameras, "cameras")
+        # `{cameras key: image file}`: that camera is sent from the file (read
+        # once, here) on every infer instead of from the observation, e.g. a
+        # fixed goal image for an image-goal navigation model.
+        self._image_files: dict[str, npt.NDArray[np.uint8]] = {}
+        for ir_key, path in _as_mapping(image_files, "image_files").items():
+            if ir_key not in self._cameras:
+                raise ValueError(
+                    f"image_files key {ir_key!r} is not one of the cameras keys "
+                    f"{sorted(self._cameras)}"
+                )
+            self._image_files[ir_key] = load_image_file(path)
         self._state_map = _as_mapping(state_map, "state_map")
         self._action_keys_override = _as_str_tuple(action_keys)
         self._prompt = prompt
@@ -177,6 +191,8 @@ class PiServerPolicy:
             camera_specs = tuple(
                 CameraSpec(name=ir_key, height=camera_height, width=camera_width)
                 for ir_key in self._cameras
+                # A file-backed camera is not something the embodiment must provide.
+                if ir_key not in self._image_files
             )
         self.info = PolicyInfo(
             name=name,
@@ -374,13 +390,18 @@ class PiServerPolicy:
 
         image: dict[str, Any] = {}
         for ir_key, wire_key in self._camera_wire_keys.items():
-            if ir_key not in observation.images:
+            if ir_key in self._image_files:
+                source = self._image_files[ir_key]
+                label = f"image_files[{ir_key!r}]"
+            elif ir_key not in observation.images:
                 raise ConfigError(
                     f"pi_server policy: observation has no image {ir_key!r} (mapped to server "
                     f"camera {wire_key!r}); available images: {sorted(observation.images)}"
                 )
-            source = observation.images[ir_key]
-            validate_image(source, f"observation.images[{ir_key!r}]")
+            else:
+                source = observation.images[ir_key]
+                label = f"observation.images[{ir_key!r}]"
+            validate_image(source, label)
             height, width = resolution_for(spec.image_preprocess, wire_key)
             resample = resample_for(spec.image_preprocess.interpolation)
             if spec.image_preprocess.resize_mode == "pad":

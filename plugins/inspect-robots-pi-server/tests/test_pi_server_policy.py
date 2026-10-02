@@ -254,6 +254,69 @@ def test_send_target_without_a_target_raises(stub_server: StubPiServer) -> None:
     policy.close()
 
 
+def _write_png(path: Path, rgb: tuple[int, int, int], size: tuple[int, int] = (20, 30)) -> str:
+    from PIL import Image
+
+    Image.new("RGB", size, rgb).save(path)
+    return str(path)
+
+
+def _decode_sent_image(infer_req: dict[str, Any], wire_key: str) -> np.ndarray:
+    from io import BytesIO
+
+    from PIL import Image
+
+    data = infer_req["inference_input"]["image"][wire_key]
+    return np.asarray(Image.open(BytesIO(data)).convert("RGB"))
+
+
+def test_image_files_sends_the_file_instead_of_the_observation(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    # Square, so the server's resize-with-pad adds no black borders.
+    goal = _write_png(tmp_path / "goal.png", (200, 30, 30), size=(16, 16))
+    policy = _policy(stub_server, image_files=f"front:{goal}")
+    policy.reset(_SCENE)
+    # The observation has no "front" image at all: the file stands in for it.
+    obs = Observation(images={}, state={"odom": np.zeros((4,), dtype=np.float32)})
+    policy.act(obs)
+    policy.act(obs)
+    infers = [r[1] for r in stub_server.requests() if r[0] == "infer"]
+    assert len(infers) == 2
+    wire_key = next(iter(infers[0]["inference_input"]["image"]))
+    for req in infers:
+        sent = _decode_sent_image(req, wire_key)
+        assert sent.shape == (8, 8, 3)  # resized per the server's spec, like a camera
+        assert abs(int(sent[..., 0].mean()) - 200) < 10 and sent[..., 1].mean() < 60
+    policy.close()
+
+
+def test_file_backed_camera_is_not_required_from_the_embodiment(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    goal = _write_png(tmp_path / "goal.png", (0, 0, 255))
+    policy = _policy(stub_server, image_files=f"front:{goal}")
+    assert policy.info.observation_space.cameras == ()
+    assert _policy(stub_server).info.observation_space.cameras != ()
+
+
+def test_image_files_key_must_be_a_camera(stub_server: StubPiServer, tmp_path: Path) -> None:
+    goal = _write_png(tmp_path / "goal.png", (0, 0, 0))
+    with pytest.raises(ValueError, match="not one of the cameras keys"):
+        _policy(stub_server, image_files=f"goal:{goal}")
+
+
+def test_unreadable_image_file_raises_at_construction(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    with pytest.raises(ValueError, match="could not read image file"):
+        _policy(stub_server, image_files=f"front:{tmp_path / 'missing.jpg'}")
+    bad = tmp_path / "not_an_image.jpg"
+    bad.write_text("hello")
+    with pytest.raises(ValueError, match="could not read image file"):
+        _policy(stub_server, image_files=f"front:{bad}")
+
+
 def test_unrecognized_state_key_raises_config_error(stub_server: StubPiServer) -> None:
     stub_server.input_spec = {"cam_head": [[8, 8, 3], "uint8"]}
     policy = _policy(stub_server)
