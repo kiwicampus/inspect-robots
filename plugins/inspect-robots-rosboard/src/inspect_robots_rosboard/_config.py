@@ -105,6 +105,10 @@ class RobotConfig:
     rate_hz: float
     observations: tuple[ObservationSpec, ...]
     actions: tuple[ActionSpec, ...]
+    # Max wait after each publish for a sequence-newer sample on the first
+    # state topic; None means the default, 2 / rate_hz. Raise it when the
+    # topic itself is fast but the websocket link has occasional delays.
+    fresh_obs_timeout_s: float | None = None
 
 
 _SUPPORTED_SAFETY_BEHAVIORS = frozenset({"zeros"})
@@ -129,6 +133,13 @@ def load_robot_config(path: str) -> RobotConfig:
     rate_hz = float(_require(raw, "rate_hz", path))
     if rate_hz <= 0:
         raise ConfigError(f"{path!r}: rate_hz must be positive, got {rate_hz!r}")
+    fresh_obs_timeout_s = raw.get("fresh_obs_timeout_s")
+    if fresh_obs_timeout_s is not None:
+        fresh_obs_timeout_s = float(fresh_obs_timeout_s)
+        if fresh_obs_timeout_s <= 0:
+            raise ConfigError(
+                f"{path!r}: fresh_obs_timeout_s must be positive, got {fresh_obs_timeout_s!r}"
+            )
 
     observations_raw = _require(raw, "observations", path)
     if not isinstance(observations_raw, list) or not observations_raw:
@@ -142,7 +153,13 @@ def load_robot_config(path: str) -> RobotConfig:
     actions = tuple(_parse_action(entry, path) for entry in actions_raw)
     _require_unique_keys(actions, path, "actions")
 
-    return RobotConfig(name=name, rate_hz=rate_hz, observations=observations, actions=actions)
+    return RobotConfig(
+        name=name,
+        rate_hz=rate_hz,
+        observations=observations,
+        actions=actions,
+        fresh_obs_timeout_s=fresh_obs_timeout_s,
+    )
 
 
 def _parse_observation(entry: Any, path: str) -> ObservationSpec:

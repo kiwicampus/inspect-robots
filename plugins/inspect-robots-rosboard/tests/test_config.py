@@ -156,6 +156,27 @@ def test_load_robot_config_rejects_non_positive_rate(tmp_path: Path) -> None:
         load_robot_config(_write_config(tmp_path, text))
 
 
+def test_fresh_obs_timeout_defaults_to_two_periods(tmp_path: Path) -> None:
+    config = load_robot_config(_write_config(tmp_path))
+    assert config.fresh_obs_timeout_s is None
+    assert RosboardEmbodiment(config=_write_config(tmp_path)).fresh_obs_timeout_s == pytest.approx(
+        0.2
+    )
+
+
+def test_fresh_obs_timeout_is_read_from_the_config(tmp_path: Path) -> None:
+    text = _MINIMAL_CONFIG.replace("rate_hz: 10.0", "rate_hz: 10.0\nfresh_obs_timeout_s: 2.5")
+    assert load_robot_config(_write_config(tmp_path, text)).fresh_obs_timeout_s == 2.5
+    assert RosboardEmbodiment(config=_write_config(tmp_path, text)).fresh_obs_timeout_s == 2.5
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_fresh_obs_timeout_must_be_positive(tmp_path: Path, value: str) -> None:
+    text = _MINIMAL_CONFIG.replace("rate_hz: 10.0", f"rate_hz: 10.0\nfresh_obs_timeout_s: {value}")
+    with pytest.raises(ConfigError, match="fresh_obs_timeout_s must be positive"):
+        load_robot_config(_write_config(tmp_path, text))
+
+
 def test_load_robot_config_rejects_observation_with_both_image_and_selector(tmp_path: Path) -> None:
     text = _MINIMAL_CONFIG.replace(
         "    image:\n      resize: [2, 3]\n",

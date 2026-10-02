@@ -578,7 +578,11 @@ class RosboardEmbodiment(EmbodimentBase):
 
         self.url = url
         self.control_hz = robot_config.rate_hz
-        self.fresh_obs_timeout_s = 2.0 / robot_config.rate_hz
+        self.fresh_obs_timeout_s = (
+            2.0 / robot_config.rate_hz
+            if robot_config.fresh_obs_timeout_s is None
+            else robot_config.fresh_obs_timeout_s
+        )
         self.obs_timeout_s = obs_timeout_s
         self._clock = clock
         self._sleep = sleep

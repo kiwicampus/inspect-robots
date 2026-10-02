@@ -159,6 +159,7 @@ inspect-robots run --task my-task --policy scripted --embodiment rosboard \
 ```yaml
 name: rover_diff_drive
 rate_hz: 10.0
+# fresh_obs_timeout_s: 2.0   # optional; default 2 / rate_hz (see Troubleshooting)
 
 observations:
   - key: observation.image.main
@@ -233,7 +234,8 @@ actions:
 - **`name`, `robot_type`, `version`, `metadata`, `max_duration_s`,
   `recording`** (top level) are accepted, for compatibility with config files
   shared across other tooling, but this adapter reads only `name` (echoed
-  into `EmbodimentInfo.docs`) and `rate_hz`; the rest are ignored.
+  into `EmbodimentInfo.docs`), `rate_hz` and the optional
+  `fresh_obs_timeout_s`; the rest are ignored.
 
 ## Observation and action contract
 
@@ -269,7 +271,10 @@ reset does not change the physical world.
   frame's resolution.
 - Fresh-observation timeouts on `step()` usually mean `control_hz` is set
   higher than the robot's real odometry rate. Lower `control_hz` or raise
-  `fresh_obs_timeout_s`.
+  `fresh_obs_timeout_s` (`-E fresh_obs_timeout_s=` in fixed-schema mode; the
+  top-level `fresh_obs_timeout_s:` key in a `config=` file, where `-E` values
+  are ignored). If the topic's own rate is fine (`ros2 topic hz`), the delay
+  is in the websocket link; a larger timeout rides it out.
 - Staleness errors mean a configured topic stopped arriving; check the robot's
   rosboard session.
 - rosboard has no `status: error` op. A command with the wrong shape or an
