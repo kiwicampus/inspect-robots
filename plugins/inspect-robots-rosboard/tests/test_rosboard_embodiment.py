@@ -615,6 +615,17 @@ def test_close_publishes_zero_twist_and_is_idempotent() -> None:
     embodiment.close()  # idempotent
 
 
+def test_observe_parked_publishes_zero_twist_without_closing() -> None:
+    embodiment, client, _clock = _ready_embodiment()
+    embodiment.reset(_SCENE)
+    embodiment.step(Action(data=np.array([0.2, 0.1])))
+    assert embodiment.observe_parked() is None
+    topic, _topic_type, fields = client.published[-1]
+    assert topic == embodiment.command_topic
+    assert fields["linear"]["x"] == 0.0 and fields["angular"]["z"] == 0.0
+    assert client.closed is False
+
+
 def test_close_before_reset_does_not_publish() -> None:
     embodiment = _embodiment()
     embodiment.close()  # never initialized; must not touch the client's publish path

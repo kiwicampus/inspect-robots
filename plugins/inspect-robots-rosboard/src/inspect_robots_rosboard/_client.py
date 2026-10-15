@@ -89,6 +89,7 @@ class RosboardClient:
         self._topics: dict[str, TopicSample] = {}
         self._subscriptions: set[str] = set()
         self._latched_error: Exception | None = None
+        self._listeners: list[Callable[[str, dict[str, Any], float], None]] = []
         self._closing = False
         self._closed = False
 
@@ -149,6 +150,14 @@ class RosboardClient:
     def publish(self, topic: str, topic_type: str, fields: Mapping[str, Any]) -> None:
         """Publish one command message, surfacing any previously latched error first."""
         self._send(publish(topic, topic_type, fields))
+
+    def add_listener(self, listener: Callable[[str, dict[str, Any], float], None]) -> None:
+        """Call ``listener(topic, payload, stamp)`` on the receive thread for every message.
+
+        Listener errors are swallowed so a recorder can never break the connection.
+        """
+        with self._lock:
+            self._listeners.append(listener)
 
     def latest(self, topic: str) -> TopicSample | None:
         """Read a topic's latest slot after surfacing any latched failure."""
@@ -229,14 +238,19 @@ class RosboardClient:
                     )
                 incoming = parse_incoming(decode_frame(raw))
                 if isinstance(incoming, TopicMessage):
+                    stamp = self._clock()
                     with self._lock:
                         previous = self._topics.get(incoming.topic_name)
                         seq = previous.seq + 1 if previous is not None else 1
                         self._topics[incoming.topic_name] = TopicSample(
                             payload=incoming.payload,
-                            stamp=self._clock(),
+                            stamp=stamp,
                             seq=seq,
                         )
+                        listeners = tuple(self._listeners)
+                    for listener in listeners:
+                        with suppress(Exception):
+                            listener(incoming.topic_name, incoming.payload, stamp)
         except Exception as exc:
             with self._lock:
                 closing = self._closing

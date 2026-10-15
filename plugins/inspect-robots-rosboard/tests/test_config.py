@@ -398,6 +398,25 @@ def test_config_close_publishes_zeros_for_safety_behavior(tmp_path: Path) -> Non
     assert zero_publishes[-1][2] == {"twist": {"linear": {"x": 0.0}, "angular": {"z": 0.0}}}
 
 
+def test_config_observe_parked_publishes_zeros_and_keeps_last_step_frames(
+    tmp_path: Path,
+) -> None:
+    embodiment, client, _clock = _ready_config_embodiment(tmp_path)
+    embodiment.reset(_SCENE)
+    embodiment.step(Action(data=np.array([1.0, 1.0])))
+
+    assert embodiment.observe_parked() is None
+    topic, _topic_type, fields = client.published[-1]
+    assert topic == "/motion_control/speed_controller/output_cmd"
+    assert fields == {"twist": {"linear": {"x": 0.0}, "angular": {"z": 0.0}}}
+    assert client.closed is False
+
+
+def test_config_observe_parked_before_reset_does_not_publish(tmp_path: Path) -> None:
+    embodiment = RosboardEmbodiment(config=_write_config(tmp_path))
+    assert embodiment.observe_parked() is None
+
+
 def test_config_close_is_a_noop_before_reset(tmp_path: Path) -> None:
     embodiment = RosboardEmbodiment(config=_write_config(tmp_path))
     embodiment.close()  # must not raise even though nothing was ever initialized

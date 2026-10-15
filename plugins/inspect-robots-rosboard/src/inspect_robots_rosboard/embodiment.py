@@ -47,8 +47,9 @@ from __future__ import annotations
 import math
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -81,19 +82,36 @@ from inspect_robots_rosboard._msgs import (
     parse_imu,
     parse_odometry,
 )
+from inspect_robots_rosboard._recorder import TopicRecorder
 from inspect_robots_rosboard._selectors import build_from_selector, select_state
 from inspect_robots_rosboard._topics_file import TopicsFile, load_topics_file
 
 _TWIST_TYPE = "geometry_msgs/msg/Twist"
 
 
-def _dry_run_action_topics(actions: tuple[ActionSpec, ...], enabled: tuple[bool, ...]) -> list[str]:
+def _parse_topics(value: str | Sequence[str] | None) -> tuple[str, ...]:
+    """``-E record_topics=/a,/b`` or a YAML list, as a tuple of topic names."""
+    if value is None:
+        return ()
+    items = value.split(",") if isinstance(value, str) else list(value)
+    return tuple(dict.fromkeys(str(item).strip() for item in items if str(item).strip()))
+
+
+def _dry_run_action_topics(
+    actions: tuple[ActionSpec, ...], enabled: tuple[bool, ...]
+) -> list[str]:
     """The publish topics of every ``actions[]`` entry not armed by ``topics_file``."""
     return [a.publish_topic for a, e in zip(actions, enabled, strict=True) if not e]
 
 
 class RosboardEmbodiment(EmbodimentBase):
     """Drive a mobile ground robot's twist controller through a rosboard websocket."""
+
+    # Set by connect_operator_session(); notices then go through it instead of stderr.
+    _operator_session: Any = None
+    _recorder: TopicRecorder | None = None
+    _step_index = 0
+    _stop_sent = True  # no command since the last stop
 
     def __init__(
         self,
@@ -112,6 +130,7 @@ class RosboardEmbodiment(EmbodimentBase):
         angular_z_limit: float = 0.5,
         control_hz: float = 10.0,
         fresh_obs_timeout_s: float | None = None,
+        record_topics: str | Sequence[str] | None = None,
         obs_timeout_s: float = 5.0,
         staleness_s: float = 2.0,
         simulated: bool = False,
@@ -148,6 +167,7 @@ class RosboardEmbodiment(EmbodimentBase):
                 url=resolved_url,
                 topics_file=topics_file,
                 topics_cfg=topics_cfg,
+                record_topics=record_topics,
                 obs_timeout_s=obs_timeout_s,
                 simulated=simulated,
                 name=name,
@@ -274,6 +294,7 @@ class RosboardEmbodiment(EmbodimentBase):
         self._client = RosboardClient(
             resolved_url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
         )
+        self._setup_recorder(_parse_topics(record_topics), topics_cfg, topics_file)
         self._publish_enabled = publish_enabled
         self._initialized = False
         self._instruction: str | None = None
@@ -292,10 +313,9 @@ class RosboardEmbodiment(EmbodimentBase):
         self._ensure_initialized()
 
         if self._reset_count >= 1 and not self._warned_no_physical_reset:
-            print(
+            self._notice(
                 "warning: rosboard embodiment has no reset mechanism; between-trial "
-                "reset does not change the physical world",
-                file=sys.stderr,
+                "reset does not change the physical world"
             )
             self._warned_no_physical_reset = True
 
@@ -303,6 +323,7 @@ class RosboardEmbodiment(EmbodimentBase):
         self._wait_for_sequences(sequences, self.obs_timeout_s, "obs_timeout_s")
         observation = self._assemble_observation()
         self._last_publish_time = None
+        self._step_index = 0
         self._reset_count += 1
         return observation
 
@@ -333,12 +354,12 @@ class RosboardEmbodiment(EmbodimentBase):
         if self._publish_enabled:
             self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(linear_x, angular_z))
         else:
-            print(
+            self._notice(
                 f"[rosboard dry-run] {self.command_topic!r} is not listed under "
                 "topics_to_stream: in the configured topics_file; would publish "
-                f"linear_x={linear_x:g} angular_z={angular_z:g} but sent nothing",
-                file=sys.stderr,
+                f"linear_x={linear_x:g} angular_z={angular_z:g} but sent nothing"
             )
+        self._record_command(publish_time, [linear_x, angular_z], self._publish_enabled)
         self._last_publish_time = publish_time
 
         try:
@@ -368,13 +389,112 @@ class RosboardEmbodiment(EmbodimentBase):
         eval ending mid-command should not leave the last nonzero twist latched
         on the robot's controller.
         """
-        if self._robot_config is not None:
-            self._close_config()
-            return
-        if self._initialized and self._publish_enabled:
-            with suppress(Exception):
-                self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(0.0, 0.0))
+        self._publish_stop()
+        if self._recorder is not None:
+            self._recorder.stop()
         self._client.close()
+
+    def connect_operator_session(self, session: Any) -> None:
+        """Hand stdin to the core operator console, so Esc, /stop and /y /n /p end a trial.
+
+        From here on notices go through ``session.write_line`` and nothing reads stdin.
+        """
+        self._operator_session = session
+
+    def observe_parked(self) -> None:
+        """Stop the robot when a trial ends, before the verdict prompt; frames stay last step.
+
+        Called by ``eval()`` for each trial about to be graded without a verdict yet.
+        """
+        self._publish_stop()
+
+    def _publish_stop(self) -> None:
+        """Best effort zero command on every enabled action (``safety_behavior: zeros``)."""
+        if not self._initialized:
+            return
+        self._stop_sent = True
+        if self._recorder is not None:
+            armed = (
+                self._publish_enabled
+                if self._robot_config is None
+                else any(self._action_publish_enabled)
+            )
+            self._recorder.command(None, self._clock(), [], armed)
+        if self._robot_config is None:
+            if self._publish_enabled:
+                with suppress(Exception):
+                    self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(0.0, 0.0))
+            return
+        for action_spec, enabled in zip(
+            self._robot_config.actions, self._action_publish_enabled, strict=True
+        ):
+            if action_spec.safety_behavior != "zeros" or not enabled:
+                continue
+            names = action_spec.selector_names + action_spec.zero_fields
+            with suppress(Exception):
+                fields = build_from_selector(names, [0.0] * len(names))
+                self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
+
+    def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+        """Open ``<log_dir>/telemetry/<run_id>/<scene>-e<epoch>.jsonl`` if topics are recorded."""
+        if self._recorder is None:
+            return
+        trial = f"{scene_id}-e{epoch}"
+        safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in trial)
+        header = {"run_id": run_id, "trial": trial, "clock": "seconds since trial start"}
+        self._recorder.start(Path(log_dir) / "telemetry" / run_id / f"{safe}.jsonl", header)
+
+    def on_trial_end(self, record: Any, log_dir: str, run_id: str) -> None:
+        """Stop the robot if a trial ended mid command (Ctrl+C, an error), then link telemetry.
+
+        The stop goes out before the telemetry file closes, so the file records it.
+        """
+        del run_id
+        if not self._stop_sent:
+            self._publish_stop()
+        path = self._recorder.stop() if self._recorder is not None else None
+        if path is None:
+            return
+        with suppress(ValueError):
+            path = path.resolve().relative_to(Path(log_dir).resolve())
+        record.metadata["telemetry"] = str(path)
+
+    def _setup_recorder(
+        self, topics: tuple[str, ...], topics_cfg: TopicsFile | None, topics_file: str | None
+    ) -> None:
+        self._step_index = 0
+        self._recorder = None
+        if not topics:
+            return
+        if topics_cfg is not None:
+            missing = [topic for topic in topics if topic not in topics_cfg.topics]
+            if missing:
+                raise ValueError(
+                    f"topics_file {topics_file!r} does not list record_topics {missing!r} "
+                    "under 'topics:'; add them there to subscribe to them"
+                )
+        self._recorder = TopicRecorder(topics, self._clock)
+        self._client.add_listener(self._recorder.on_sample)
+
+    def _subscribe_recorded(self, already: tuple[str, ...]) -> None:
+        if self._recorder is None:
+            return
+        for topic in self._recorder.topics:
+            if topic not in already:
+                self._client.subscribe(topic)
+
+    def _record_command(self, stamp: float, values: Sequence[float], published: bool) -> None:
+        if self._recorder is not None:
+            self._recorder.command(self._step_index, stamp, values, published)
+        self._step_index += 1
+        self._stop_sent = False
+
+    def _notice(self, text: str) -> None:
+        """Status line for the operator: through the console when connected, else stderr."""
+        if self._operator_session is not None:
+            self._operator_session.write_line(text)
+        else:
+            print(text, file=sys.stderr)
 
     def __enter__(self) -> RosboardEmbodiment:
         return self
@@ -395,6 +515,7 @@ class RosboardEmbodiment(EmbodimentBase):
             ) from exc
         for topic in self._all_topics():
             self._client.subscribe(topic)
+        self._subscribe_recorded(self._all_topics())
         self._wait_for_sequences(
             dict.fromkeys(self._all_topics(), 0), self.obs_timeout_s, "obs_timeout_s"
         )
@@ -486,6 +607,7 @@ class RosboardEmbodiment(EmbodimentBase):
         url: str,
         topics_file: str | None,
         topics_cfg: TopicsFile | None,
+        record_topics: str | Sequence[str] | None,
         obs_timeout_s: float,
         simulated: bool,
         name: str,
@@ -589,6 +711,9 @@ class RosboardEmbodiment(EmbodimentBase):
         self._client = RosboardClient(
             url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
         )
+        self._setup_recorder(
+            _parse_topics(record_topics) or robot_config.record_topics, topics_cfg, topics_file
+        )
         self._action_publish_enabled = action_publish_enabled
         self._robot_config = robot_config
         self._initialized = False
@@ -604,10 +729,9 @@ class RosboardEmbodiment(EmbodimentBase):
         self._ensure_initialized_config()
 
         if self._reset_count >= 1 and not self._warned_no_physical_reset:
-            print(
+            self._notice(
                 "warning: rosboard embodiment has no reset mechanism; between-trial "
-                "reset does not change the physical world",
-                file=sys.stderr,
+                "reset does not change the physical world"
             )
             self._warned_no_physical_reset = True
 
@@ -616,6 +740,7 @@ class RosboardEmbodiment(EmbodimentBase):
         self._wait_for_sequences(sequences, self.obs_timeout_s, "obs_timeout_s")
         observation = self._assemble_observation_config()
         self._last_publish_time = None
+        self._step_index = 0
         self._reset_count += 1
         return observation
 
@@ -638,6 +763,7 @@ class RosboardEmbodiment(EmbodimentBase):
         publish_time = self._clock()
 
         offset = 0
+        sent: list[float] = []
         for action_spec, enabled in zip(
             self._robot_config.actions, self._action_publish_enabled, strict=True
         ):
@@ -646,18 +772,19 @@ class RosboardEmbodiment(EmbodimentBase):
                 data[offset : offset + n], action_spec.clamp_low, action_spec.clamp_high
             )
             offset += n
+            sent.extend(clamped.tolist())
             names = action_spec.selector_names + action_spec.zero_fields
             values = [*clamped.tolist(), *([0.0] * len(action_spec.zero_fields))]
             fields = build_from_selector(names, values)
             if enabled:
                 self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
             else:
-                print(
+                self._notice(
                     f"[rosboard dry-run] {action_spec.publish_topic!r} is not listed "
                     "under topics_to_stream: in the configured topics_file; would "
-                    f"publish {fields!r} but sent nothing",
-                    file=sys.stderr,
+                    f"publish {fields!r} but sent nothing"
                 )
+        self._record_command(publish_time, sent, any(self._action_publish_enabled))
         self._last_publish_time = publish_time
 
         try:
@@ -678,23 +805,6 @@ class RosboardEmbodiment(EmbodimentBase):
             truncated=False,
         )
 
-    def _close_config(self) -> None:
-        assert self._robot_config is not None
-        if self._initialized:
-            for action_spec, enabled in zip(
-                self._robot_config.actions, self._action_publish_enabled, strict=True
-            ):
-                if action_spec.safety_behavior != "zeros" or not enabled:
-                    continue
-                names = action_spec.selector_names + action_spec.zero_fields
-                zeros = [0.0] * len(names)
-                with suppress(Exception):
-                    fields = build_from_selector(names, zeros)
-                    self._client.publish(
-                        action_spec.publish_topic, action_spec.publish_type, fields
-                    )
-        self._client.close()
-
     def _ensure_initialized_config(self) -> None:
         if self._initialized:
             return
@@ -709,6 +819,7 @@ class RosboardEmbodiment(EmbodimentBase):
         topics = self._all_topics_config()
         for topic in topics:
             self._client.subscribe(topic)
+        self._subscribe_recorded(topics)
         self._wait_for_sequences(dict.fromkeys(topics, 0), self.obs_timeout_s, "obs_timeout_s")
         self._initialized = True
 

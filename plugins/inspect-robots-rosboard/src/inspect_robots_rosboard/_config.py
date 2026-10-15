@@ -109,6 +109,8 @@ class RobotConfig:
     # state topic; None means the default, 2 / rate_hz. Raise it when the
     # topic itself is fast but the websocket link has occasional delays.
     fresh_obs_timeout_s: float | None = None
+    # Topics whose every sample is written to a per trial telemetry JSONL (read only).
+    record_topics: tuple[str, ...] = ()
 
 
 _SUPPORTED_SAFETY_BEHAVIORS = frozenset({"zeros"})
@@ -141,6 +143,13 @@ def load_robot_config(path: str) -> RobotConfig:
                 f"{path!r}: fresh_obs_timeout_s must be positive, got {fresh_obs_timeout_s!r}"
             )
 
+    record_topics_raw = raw.get("record_topics") or []
+    if not isinstance(record_topics_raw, list) or not all(
+        isinstance(topic, str) and topic for topic in record_topics_raw
+    ):
+        raise ConfigError(f"{path!r}: record_topics must be a list of topic names")
+    record_topics = tuple(dict.fromkeys(record_topics_raw))
+
     observations_raw = _require(raw, "observations", path)
     if not isinstance(observations_raw, list) or not observations_raw:
         raise ConfigError(f"{path!r}: observations must be a non-empty list")
@@ -159,6 +168,7 @@ def load_robot_config(path: str) -> RobotConfig:
         observations=observations,
         actions=actions,
         fresh_obs_timeout_s=fresh_obs_timeout_s,
+        record_topics=record_topics,
     )
 
 

@@ -15,8 +15,12 @@
 - rosboard has no `status: error` equivalent: a malformed or mistyped command
   can fail silently server-side. Watch the robot's own rosboard logs during
   first runs.
-- `close()` publishes a zero-velocity stop command before disconnecting, but
-  that is a best-effort courtesy, not a substitute for a real e-stop.
+- The same zero-velocity stop command goes out when each trial ends (before
+  the verdict prompt) and on `close()`, before disconnecting. Both are best
+  effort, not a substitute for a real e-stop.
+- In an interactive `inspect-robots run`, the operator console is on: Esc or
+  `/stop [note]` ends the trial early and it is still scored; `/y`, `/n`,
+  `/p [note]` also record the verdict. Ctrl+C cancels the trial unscored.
 - To rehearse a full policy+embodiment run risk-free before arming it, use
   `-E topics_file=topics_to_subscribe.yaml` with the command topic commented
   out: the loop runs end to end (observations, inference, clamping) but
@@ -87,6 +91,7 @@ Pass values as `-E key=value` arguments or as keyword arguments to
 | `angular_z_limit` | `0.5` | Max absolute turn rate (rad/s). Both the declared action bound and an independent hard clamp inside `step()`. |
 | `control_hz` | `10.0` | Command rate. The adapter sleep-gates each publish to this rate. |
 | `fresh_obs_timeout_s` | `2/control_hz` | Maximum step-time wait for a sequence-newer odometry message. |
+| `record_topics` | none | Comma separated topics whose every sample, plus each command sent, goes to `<log_dir>/telemetry/<run>/<trial>.jsonl` (read only). |
 | `obs_timeout_s` | `5.0` | Reset-time wait for the first (and subsequent) messages on every configured topic. |
 | `staleness_s` | `2.0` | Maximum cached sample age and cross-modal skew bound during observation assembly. |
 | `simulated` | `False` | Set true only if pointed at a simulated rosboard source. |
@@ -160,6 +165,7 @@ inspect-robots run --task my-task --policy scripted --embodiment rosboard \
 name: rover_diff_drive
 rate_hz: 10.0
 # fresh_obs_timeout_s: 2.0   # optional; default 2 / rate_hz (see Troubleshooting)
+# record_topics: [/odometry/local, /fix]   # optional; per trial telemetry JSONL, read only
 
 observations:
   - key: observation.image.main
@@ -218,7 +224,7 @@ actions:
   file order, of every entry's `selector.names`. Only `from_tensor.clamp`
   (required, `[low, high]`, applied to every dimension of that entry) and
   `safety_behavior: zeros` (the only supported value; publishes a zero vector
-  to that topic on `close()`) are honored. `publish.qos` and `publish.strategy`
+  to that topic at the end of each trial and on `close()`) are honored. `publish.qos` and `publish.strategy`
   (fifo/nearest re-pacing) are parsed but unused: this adapter already
   executes one action per closed-loop `step()` call, so there is no queued
   chunk to re-pace here; that question belongs to whatever plays a policy's
@@ -235,7 +241,7 @@ actions:
   `recording`** (top level) are accepted, for compatibility with config files
   shared across other tooling, but this adapter reads only `name` (echoed
   into `EmbodimentInfo.docs`), `rate_hz` and the optional
-  `fresh_obs_timeout_s`; the rest are ignored.
+  `fresh_obs_timeout_s` and `record_topics`; the rest are ignored.
 
 ## Observation and action contract
 

@@ -312,3 +312,35 @@ def test_close_config_dry_run_does_not_publish_zero_twist(tmp_path: Path) -> Non
     embodiment.close()
     assert len(client.published) == published_before
     assert client.closed is True
+
+
+def test_observe_parked_config_dry_run_does_not_publish(tmp_path: Path) -> None:
+    embodiment, client, _clock = _ready_config_embodiment_with_topics_file(
+        tmp_path, _REAL_TOPICS_FILE
+    )
+    embodiment.reset(_SCENE)
+    published_before = len(client.published)
+    embodiment.observe_parked()
+    assert len(client.published) == published_before
+
+
+def test_dry_run_notice_goes_to_connected_operator_session(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Session:
+        def __init__(self) -> None:
+            self.lines: list[str] = []
+
+        def write_line(self, text: str) -> None:
+            self.lines.append(text)
+
+    embodiment, _client, _clock = _ready_config_embodiment_with_topics_file(
+        tmp_path, _REAL_TOPICS_FILE
+    )
+    session = Session()
+    embodiment.connect_operator_session(session)
+    embodiment.reset(_SCENE)
+    embodiment.step(Action(data=np.array([0.1, 0.0])))
+
+    assert capsys.readouterr().err == ""
+    assert any("dry-run" in line for line in session.lines)
