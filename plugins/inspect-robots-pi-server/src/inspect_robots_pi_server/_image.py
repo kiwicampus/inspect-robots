@@ -14,6 +14,7 @@ float normalization step here, unlike the in-process LeRobot policy plugin.
 
 from __future__ import annotations
 
+import base64
 from io import BytesIO
 
 import numpy as np
@@ -35,6 +36,15 @@ def load_image_file(path: str) -> npt.NDArray[np.uint8]:
             return np.asarray(img.convert("RGB"), dtype=np.uint8).copy()
     except (OSError, ValueError) as exc:
         raise ValueError(f"could not read image file {path!r}: {exc}") from exc
+
+
+def preview_data_url(image: npt.NDArray[np.uint8], max_side: int = 320) -> str:
+    """Small JPEG data URL of ``image``, for logs that should show what was sent."""
+    preview = Image.fromarray(image)
+    preview.thumbnail((max_side, max_side))
+    buffer = BytesIO()
+    preview.save(buffer, format="JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def validate_image(image: npt.NDArray[np.uint8], label: str) -> None:

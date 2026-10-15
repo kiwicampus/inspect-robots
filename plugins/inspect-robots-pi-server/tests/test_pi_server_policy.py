@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from _stub_server import StubPiServer
 from inspect_robots.compat import check_compatibility
 from inspect_robots.embodiment import EmbodimentInfo
 from inspect_robots.errors import ConfigError
+from inspect_robots.rollout import TrialRecord
 from inspect_robots.scene import Scene, Target
 from inspect_robots.spaces import ActionSemantics, Box, ObservationSpace
 from inspect_robots.types import Observation
@@ -123,8 +125,23 @@ def test_debug_surfaces_in_meta_and_optional_log(
     lines = debug_log.read_text().splitlines()
     assert len(lines) == 2
     first, second = (json.loads(line) for line in lines)
+    assert [first.pop("timing") is not None, second.pop("timing") is not None] == [True, True]
     assert first == {"t": 0, "raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
     assert second == {"t": 1, "raw_waypoints": [[0.1, 0.2, 1.0, 0.0]]}
+    policy.close()
+
+
+def test_debug_row_times_the_round_trip_and_the_server(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    stub_server.debug_payload = {"raw_waypoints": []}
+    debug_log = tmp_path / "run.jsonl"
+    policy = _policy(stub_server, debug_log=str(debug_log))
+    policy.reset(_SCENE)
+    policy.act(_observation())
+    timing = json.loads(debug_log.read_text().splitlines()[0])["timing"]
+    assert timing["server_total_ms"] == 2.0 and timing["server_processing_ms"] == 1.0
+    assert timing["round_trip_ms"] > 0 and timing["request_bytes"] > 100  # the JPEG images count
     policy.close()
 
 
@@ -140,6 +157,69 @@ def test_debug_log_reset_between_trials(stub_server: StubPiServer, tmp_path: Pat
 
     lines = [json.loads(line) for line in debug_log.read_text().splitlines()]
     assert [entry["t"] for entry in lines] == [0, 0]
+    policy.close()
+
+
+def test_debug_log_auto_writes_one_file_per_trial_with_header(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    stub_server.debug_payload = {"raw_waypoints": [[0.0, 0.0, 1.0, 0.0]]}
+    policy = _policy(stub_server, debug_log="auto", extra="modality:language", send_target=False)
+
+    record = TrialRecord(scene_id="s0", epoch=1, seed=0, status="success")
+    policy.on_trial_start("s0", 1, str(tmp_path), "run1")
+    policy.reset(_SCENE)
+    policy.act(_observation())
+    policy.on_trial_end(record, str(tmp_path), "run1")
+
+    path = tmp_path / "debug" / "run1" / "s0-e1.jsonl"
+    header, row = (json.loads(line) for line in path.read_text().splitlines())
+    assert header == {
+        "kind": "header",
+        "run_id": "run1",
+        "trial": "s0-e1",
+        "url": stub_server.url,
+        "extra": {"modality": "language"},
+        "send_target": False,
+        "image_files": {},
+    }
+    assert "round_trip_ms" in row.pop("timing")
+    assert row == {"t": 0, "raw_waypoints": [[0.0, 0.0, 1.0, 0.0]]}
+    assert record.metadata["debug_log"] == "debug/run1/s0-e1.jsonl"
+    policy.close()
+
+
+def test_debug_log_file_outside_log_dir_appends_and_is_recorded_absolute(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    stub_server.debug_payload = {"raw_waypoints": [[0.0, 0.0, 1.0, 0.0]]}
+    debug_log = tmp_path / "elsewhere" / "run.jsonl"
+    policy = _policy(stub_server, debug_log=str(debug_log))
+    log_dir = tmp_path / "logs"
+
+    for run_id in ("a", "b"):
+        record = TrialRecord(scene_id="s0", epoch=0, seed=0, status="success")
+        policy.on_trial_start("s0", 0, str(log_dir), run_id)
+        policy.reset(_SCENE)
+        policy.act(_observation())
+        policy.on_trial_end(record, str(log_dir), run_id)
+        assert record.metadata["debug_log"] == str(debug_log)
+
+    rows = [json.loads(line) for line in debug_log.read_text().splitlines()]
+    assert [r.get("kind", r.get("t")) for r in rows] == ["header", 0, "header", 0]
+    assert [r["run_id"] for r in rows if r.get("kind") == "header"] == ["a", "b"]
+    policy.close()
+
+
+def test_on_trial_end_without_debug_log_leaves_metadata_alone(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    policy = _policy(stub_server)
+    record = TrialRecord(scene_id="s0", epoch=0, seed=0, status="success")
+    policy.on_trial_start("s0", 0, str(tmp_path), "run1")
+    policy.on_trial_end(record, str(tmp_path), "run1")
+    assert "debug_log" not in record.metadata
+    assert not (tmp_path / "debug").exists()
     policy.close()
 
 
@@ -201,7 +281,9 @@ def test_extra_is_sent_on_every_infer(stub_server: StubPiServer, extra: object) 
 def test_malformed_extra_raises_at_construction() -> None:
     with pytest.raises(ValueError, match="extra entry"):
         PiServerPolicy(
-            url="ws://198.51.100.1:1", control_mode="base_velocity", action_dim=2,
+            url="ws://198.51.100.1:1",
+            control_mode="base_velocity",
+            action_dim=2,
             extra="modality",
         )
 
@@ -220,6 +302,26 @@ def test_extra_state_is_sent_as_float64_lists(stub_server: StubPiServer) -> None
         "modality": "gps",
         "gps": [4.6097123456, lon],
     }
+    policy.close()
+
+
+def test_debug_row_records_sent_extra_state(stub_server: StubPiServer, tmp_path: Path) -> None:
+    stub_server.debug_payload = {"raw_waypoints": [[0.0, 0.0, 1.0, 0.0]]}
+    debug_log = tmp_path / "run.jsonl"
+    policy = _policy(
+        stub_server, extra="modality:image", extra_state="gps:gps", debug_log=str(debug_log)
+    )
+    policy.reset(_SCENE)
+    obs = Observation(
+        images={"front": np.zeros((16, 16, 3), dtype=np.uint8)},
+        state={
+            "odom": np.zeros((4,), dtype=np.float32),
+            "gps": np.array([4.6097123456, -74.05211]),
+        },
+    )
+    policy.act(obs)
+    row = json.loads(debug_log.read_text().splitlines()[0])
+    assert row["sent_state"] == {"gps": [4.6097123456, -74.05211]}
     policy.close()
 
 
@@ -288,6 +390,25 @@ def test_image_files_sends_the_file_instead_of_the_observation(
         sent = _decode_sent_image(req, wire_key)
         assert sent.shape == (8, 8, 3)  # resized per the server's spec, like a camera
         assert abs(int(sent[..., 0].mean()) - 200) < 10 and sent[..., 1].mean() < 60
+    policy.close()
+
+
+def test_debug_header_shows_the_image_file_that_was_sent(
+    stub_server: StubPiServer, tmp_path: Path
+) -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    goal = _write_png(tmp_path / "goal.png", (200, 30, 30), size=(640, 480))
+    policy = _policy(stub_server, image_files=f"front:{goal}", debug_log="auto")
+    policy.on_trial_start("s0", 0, str(tmp_path), "run1")
+    header = json.loads((tmp_path / "debug" / "run1" / "s0-e0.jsonl").read_text().splitlines()[0])
+    entry = header["image_files"]["front"]
+    assert entry["path"] == str(goal)
+    jpeg = base64.b64decode(entry["preview"].removeprefix("data:image/jpeg;base64,"))
+    preview = np.asarray(Image.open(BytesIO(jpeg)).convert("RGB"))
+    assert preview.shape == (240, 320, 3) and abs(int(preview[..., 0].mean()) - 200) < 10
     policy.close()
 
 
@@ -442,7 +563,9 @@ def test_action_horizon_dim_absent_sends_null_fields(stub_server: StubPiServer) 
     policy.close()
 
 
-def test_server_error_frame_surfaces_and_connection_stays_usable(stub_server: StubPiServer) -> None:
+def test_server_error_frame_surfaces_and_connection_stays_usable(
+    stub_server: StubPiServer,
+) -> None:
     policy = _policy(stub_server)
     policy.reset(_SCENE)
     obs = Observation(

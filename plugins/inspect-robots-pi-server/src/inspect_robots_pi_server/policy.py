@@ -56,6 +56,7 @@ from inspect_robots import (
     PolicyConfig,
     PolicyInfo,
     Scene,
+    TrialRecord,
 )
 from inspect_robots.errors import ConfigError
 from inspect_robots.spaces import ControlMode, Frame, GripperKind, RotationRepr
@@ -63,6 +64,7 @@ from inspect_robots_pi_server._client import PolicyClient
 from inspect_robots_pi_server._image import (
     jpeg_encode,
     load_image_file,
+    preview_data_url,
     resample_for,
     resize_stretch,
     resize_with_pad,
@@ -102,6 +104,19 @@ def _as_str_tuple(value: Sequence[str] | str | None) -> tuple[str, ...] | None:
     if isinstance(value, str):
         return tuple(item.strip() for item in value.split(",") if item.strip())
     return tuple(value)
+
+
+def _payload_bytes(value: Any) -> int:
+    """Size of the arrays and encoded images (JPEG bytes) in a request, most of the wire size."""
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return len(value)
+    if isinstance(value, dict):
+        return sum(_payload_bytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_payload_bytes(v) for v in value)
+    return 0
 
 
 class PiServerPolicy:
@@ -152,7 +167,8 @@ class PiServerPolicy:
         # once, here) on every infer instead of from the observation, e.g. a
         # fixed goal image for an image-goal navigation model.
         self._image_files: dict[str, npt.NDArray[np.uint8]] = {}
-        for ir_key, path in _as_mapping(image_files, "image_files").items():
+        self._image_file_paths = _as_mapping(image_files, "image_files")
+        for ir_key, path in self._image_file_paths.items():
             if ir_key not in self._cameras:
                 raise ValueError(
                     f"image_files key {ir_key!r} is not one of the cameras keys "
@@ -180,7 +196,10 @@ class PiServerPolicy:
         # Deliberately not routed through inspect_robots' own action-trace
         # writer: that's core, numpy-only, 100%-coverage-gated code with a
         # fixed {"t", "action"} schema; this stays entirely inside the plugin.
-        self._debug_log_path = Path(debug_log) if debug_log else None
+        # `auto` writes one file per trial under `<log_dir>/debug/<run_id>/`.
+        self._debug_log_auto = debug_log == "auto"
+        self._debug_log_path = Path(debug_log) if debug_log and not self._debug_log_auto else None
+        self._trial_debug_path: Path | None = None
         self._debug_step = 0
 
         semantics = ActionSemantics(
@@ -274,7 +293,7 @@ class PiServerPolicy:
         debug = inner_result.get("debug") if isinstance(inner_result, dict) else None
         if debug:
             meta["debug"] = debug
-            self._log_debug(debug)
+            self._log_debug(debug, request, latency_s, result)
         self._debug_step += 1
         return ActionChunk(
             actions=actions,
@@ -282,6 +301,39 @@ class PiServerPolicy:
             inference_latency_s=latency_s,
             meta=meta,
         )
+
+    def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+        """Open this trial's debug log and write its header row (run id and request settings)."""
+        if self._debug_log_auto:
+            self._trial_debug_path = (
+                Path(log_dir) / "debug" / run_id / f"{scene_id}-e{epoch}.jsonl"
+            )
+        else:
+            self._trial_debug_path = self._debug_log_path
+        self._write_debug_row(
+            {
+                "kind": "header",
+                "run_id": run_id,
+                "trial": f"{scene_id}-e{epoch}",
+                "url": self.server_url,
+                "extra": self._extra,
+                "send_target": self._send_target,
+                "image_files": {
+                    key: {"path": path, "preview": preview_data_url(self._image_files[key])}
+                    for key, path in self._image_file_paths.items()
+                },
+            }
+        )
+
+    def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
+        """Record this trial's debug log in the eval log, relative to ``log_dir`` when inside it."""
+        path = self._trial_debug_path
+        if path is None or not path.exists():
+            return
+        try:
+            record.metadata["debug_log"] = str(path.resolve().relative_to(Path(log_dir).resolve()))
+        except ValueError:
+            record.metadata["debug_log"] = str(path)
 
     def close(self) -> None:
         """Drop the websocket connection; idempotent."""
@@ -305,18 +357,44 @@ class PiServerPolicy:
         with suppress(Exception):
             self.close()
 
-    def _log_debug(self, debug: dict[str, Any]) -> None:
+    def _log_debug(
+        self,
+        debug: dict[str, Any],
+        request: dict[str, Any],
+        latency_s: float,
+        result: dict[str, Any],
+    ) -> None:
         """Append one JSONL line of server-provided diagnostics, if configured.
 
-        Best-effort: a logging failure must not take down a live rollout, so
-        this only ever warns to stderr, never raises.
+        The ``extra_state`` values this step sent go under ``sent_state`` at full float64, and
+        ``timing`` splits the round trip from the server's own time. Best-effort: a logging
+        failure must not take down a live rollout, so this only ever warns to stderr.
         """
-        if self._debug_log_path is None:
+        extra = request["inference_input"].get("extra") or {}
+        sent = {key: extra[key] for key in self._extra_state.values() if key in extra}
+        row = {"t": self._debug_step, **debug}
+        if sent:
+            row["sent_state"] = sent
+        timing = {"round_trip_ms": round(latency_s * 1000.0, 1)}
+        for key, name in (
+            ("server_total_time_ms", "server_total_ms"),
+            ("server_processing_time_ms", "server_processing_ms"),
+        ):
+            if isinstance(result.get(key), (int, float)):
+                timing[name] = round(float(result[key]), 1)
+        timing["request_bytes"] = _payload_bytes(request)
+        row["timing"] = timing
+        self._write_debug_row(row)
+
+    def _write_debug_row(self, row: dict[str, Any]) -> None:
+        # The trial path is set by on_trial_start; direct reset()/act() use falls back to the file.
+        path = self._trial_debug_path or self._debug_log_path
+        if path is None:
             return
         try:
-            self._debug_log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self._debug_log_path.open("a") as f:
-                f.write(json.dumps({"t": self._debug_step, **debug}) + "\n")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a") as f:
+                f.write(json.dumps(row) + "\n")
         except OSError as exc:
             print(f"pi_server policy: failed to write debug_log: {exc}", file=sys.stderr)
 
