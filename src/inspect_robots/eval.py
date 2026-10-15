@@ -495,15 +495,23 @@ def _run_eval(
             bus.on_trial_start(scene.id, epoch)
             record: TrialRecord | None = None
             policy_start_failed = False
-            on_trial_start = getattr(policy, "on_trial_start", None)
-            if callable(on_trial_start):
+            # Policy, then embodiment; only components whose start hook ran get the end hook.
+            hooked: list[tuple[str, Any]] = []
+            for owner, component in (("policy", policy), ("embodiment", embodiment)):
+                on_trial_start = getattr(component, "on_trial_start", None)
+                if policy_start_failed:
+                    break
+                if not callable(on_trial_start):
+                    hooked.append((owner, component))
+                    continue
                 try:
                     on_trial_start(scene.id, epoch, log_dir, run_stamp)
+                    hooked.append((owner, component))
                 except Exception as exc:
                     policy_start_failed = True
                     error_count += 1
                     scene_status = "error"
-                    scene_error = f"policy.on_trial_start failed: {exc}"
+                    scene_error = f"{owner}.on_trial_start failed: {exc}"
                     record = TrialRecord(
                         scene_id=scene.id,
                         epoch=epoch,
@@ -619,15 +627,15 @@ def _run_eval(
 
                 # A never-reset trial must not persist the previous trial's
                 # policy state under this trial's identity.
-                if not policy_start_failed:
-                    on_trial_end = getattr(policy, "on_trial_end", None)
+                for owner, component in hooked:
+                    on_trial_end = getattr(component, "on_trial_end", None)
                     if callable(on_trial_end):
                         try:
                             on_trial_end(record, log_dir, run_stamp)
                         except Exception as exc:
                             # Named `detail`, not `note`: a grader's note is a
                             # different thing entirely and is collected just above.
-                            detail = f"policy.on_trial_end failed: {exc}"
+                            detail = f"{owner}.on_trial_end failed: {exc}"
                             scene_status = "error"
                             scene_error = (
                                 detail if scene_error is None else f"{scene_error}; {detail}"
