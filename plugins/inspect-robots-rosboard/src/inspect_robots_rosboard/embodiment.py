@@ -76,6 +76,7 @@ from inspect_robots_rosboard._config import (
     RobotConfig,
     load_robot_config,
 )
+from inspect_robots_rosboard._hold import CommandHold, Frame
 from inspect_robots_rosboard._msgs import (
     build_twist,
     parse_compressed_image,
@@ -110,6 +111,8 @@ class RosboardEmbodiment(EmbodimentBase):
     # Set by connect_operator_session(); notices then go through it instead of stderr.
     _operator_session: Any = None
     _recorder: TopicRecorder | None = None
+    # Config mode with command_hold_s > 0: keeps each step's command alive until it is that old.
+    _hold: CommandHold | None = None
     _step_index = 0
     _stop_sent = True  # no command since the last stop
 
@@ -389,6 +392,8 @@ class RosboardEmbodiment(EmbodimentBase):
         eval ending mid-command should not leave the last nonzero twist latched
         on the robot's controller.
         """
+        if self._hold is not None:
+            self._hold.close()
         self._publish_stop()
         if self._recorder is not None:
             self._recorder.stop()
@@ -410,6 +415,8 @@ class RosboardEmbodiment(EmbodimentBase):
 
     def _publish_stop(self) -> None:
         """Best effort zero command on every enabled action (``safety_behavior: zeros``)."""
+        if self._hold is not None:
+            self._hold.disarm()
         if not self._initialized:
             return
         self._stop_sent = True
@@ -425,15 +432,27 @@ class RosboardEmbodiment(EmbodimentBase):
                 with suppress(Exception):
                     self._client.publish(self.command_topic, _TWIST_TYPE, build_twist(0.0, 0.0))
             return
+        for topic, topic_type, fields in self._zero_frames():
+            with suppress(Exception):
+                self._client.publish(topic, topic_type, fields)
+
+    def _zero_frames(self) -> list[Frame]:
+        """The zero command of every enabled action whose ``safety_behavior`` is ``zeros``."""
+        assert self._robot_config is not None
+        frames: list[Frame] = []
         for action_spec, enabled in zip(
             self._robot_config.actions, self._action_publish_enabled, strict=True
         ):
             if action_spec.safety_behavior != "zeros" or not enabled:
                 continue
             names = action_spec.selector_names + action_spec.zero_fields
-            with suppress(Exception):
-                fields = build_from_selector(names, [0.0] * len(names))
-                self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
+            fields = build_from_selector(names, [0.0] * len(names))
+            frames.append((action_spec.publish_topic, action_spec.publish_type, fields))
+        return frames
+
+    def _on_hold_expired(self, stamp: float) -> None:
+        if self._recorder is not None:
+            self._recorder.event("hold_end", stamp)
 
     def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
         """Open ``<log_dir>/telemetry/<run_id>/<scene>-e<epoch>.jsonl`` if topics are recorded."""
@@ -441,7 +460,14 @@ class RosboardEmbodiment(EmbodimentBase):
             return
         trial = f"{scene_id}-e{epoch}"
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in trial)
-        header = {"run_id": run_id, "trial": trial, "clock": "seconds since trial start"}
+        header: dict[str, Any] = {
+            "run_id": run_id,
+            "trial": trial,
+            "clock": "seconds since trial start",
+        }
+        if self._hold is not None:
+            header["command_hold_s"] = self._hold.hold_s
+            header["command_resend_hz"] = 1.0 / self._hold.period
         self._recorder.start(Path(log_dir) / "telemetry" / run_id / f"{safe}.jsonl", header)
 
     def on_trial_end(self, record: Any, log_dir: str, run_id: str) -> None:
@@ -716,6 +742,14 @@ class RosboardEmbodiment(EmbodimentBase):
         )
         self._action_publish_enabled = action_publish_enabled
         self._robot_config = robot_config
+        if robot_config.command_hold_s > 0:
+            self._hold = CommandHold(
+                lambda topic, kind, fields: self._client.publish(topic, kind, fields),
+                hold_s=robot_config.command_hold_s,
+                resend_hz=robot_config.command_resend_hz,
+                clock=clock,
+                on_expire=self._on_hold_expired,
+            )
         self._initialized = False
         self._instruction = None
         self._last_publish_time = None
@@ -760,10 +794,13 @@ class RosboardEmbodiment(EmbodimentBase):
 
         reference_spec = self._freshness_reference_spec()
         seq_at_publish = self._client.sequence(reference_spec.topic)
+        if self._hold is not None:
+            self._hold.disarm()
         publish_time = self._clock()
 
         offset = 0
         sent: list[float] = []
+        held: list[Frame] = []
         for action_spec, enabled in zip(
             self._robot_config.actions, self._action_publish_enabled, strict=True
         ):
@@ -778,6 +815,7 @@ class RosboardEmbodiment(EmbodimentBase):
             fields = build_from_selector(names, values)
             if enabled:
                 self._client.publish(action_spec.publish_topic, action_spec.publish_type, fields)
+                held.append((action_spec.publish_topic, action_spec.publish_type, fields))
             else:
                 self._notice(
                     f"[rosboard dry-run] {action_spec.publish_topic!r} is not listed "
@@ -786,6 +824,8 @@ class RosboardEmbodiment(EmbodimentBase):
                 )
         self._record_command(publish_time, sent, any(self._action_publish_enabled))
         self._last_publish_time = publish_time
+        if self._hold is not None:
+            self._hold.arm(held, self._zero_frames(), publish_time)
 
         try:
             self._client.wait_for_sample(

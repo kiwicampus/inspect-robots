@@ -96,6 +96,12 @@ class TopicRecorder:
             }
         )
 
+    def event(self, kind: str, stamp: float) -> None:
+        """Record a timestamped event row, such as the end of a held command."""
+        if self._file is None:
+            return
+        self._write({"kind": kind, "stamp": round(stamp - self._t0, 4)})
+
     def _write(self, row: dict[str, Any]) -> None:
         line = json.dumps(row, allow_nan=False, default=str) + "\n"
         with self._lock:

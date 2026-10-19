@@ -166,6 +166,8 @@ name: rover_diff_drive
 rate_hz: 10.0
 # fresh_obs_timeout_s: 2.0   # optional; default 2 / rate_hz (see Troubleshooting)
 # record_topics: [/odometry/local, /fix]   # optional; per trial telemetry JSONL, read only
+# command_hold_s: ${HOLD_TIME:-0.7}   # optional; resend each command until this old, then zeros once
+# command_resend_hz: 10.0   # optional; resend rate while a command is held
 
 observations:
   - key: observation.image.main
@@ -241,7 +243,19 @@ actions:
   `recording`** (top level) are accepted, for compatibility with config files
   shared across other tooling, but this adapter reads only `name` (echoed
   into `EmbodimentInfo.docs`), `rate_hz` and the optional
-  `fresh_obs_timeout_s` and `record_topics`; the rest are ignored.
+  `fresh_obs_timeout_s`, `record_topics`, `command_hold_s` and
+  `command_resend_hz`; the rest are ignored.
+- **`command_hold_s`** (default 0, off): a controller that zeroes its
+  reference after a short timeout sees each step's command as a brief pulse
+  when the policy is slower than that timeout. With a hold, the embodiment
+  resends the step's command at `command_resend_hz` until it is
+  `command_hold_s` old, then publishes the zero command once (actions with
+  `safety_behavior: zeros`). A new step, a stop or `close()` ends the hold
+  first. Telemetry gets a `hold_end` row at each expiry, and its header
+  records both values. Dry run actions are never held.
+- **Environment variables:** `${NAME}` or `${NAME:-default}` anywhere in the
+  config file is replaced before parsing, so a value can change per run
+  without editing the file. An unset variable without a default is an error.
 
 ## Observation and action contract
 

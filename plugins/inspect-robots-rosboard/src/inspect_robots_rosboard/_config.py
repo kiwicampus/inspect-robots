@@ -26,6 +26,9 @@ other systems, but this adapter does not read them.
 
 from __future__ import annotations
 
+import math
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -111,9 +114,30 @@ class RobotConfig:
     fresh_obs_timeout_s: float | None = None
     # Topics whose every sample is written to a per trial telemetry JSONL (read only).
     record_topics: tuple[str, ...] = ()
+    # Seconds each command is resent after its step (0 = sent once), then zeros go out once.
+    command_hold_s: float = 0.0
+    command_resend_hz: float = 10.0
 
 
 _SUPPORTED_SAFETY_BEHAVIORS = frozenset({"zeros"})
+# ``${NAME}`` or ``${NAME:-default}`` anywhere in the file, replaced before YAML parsing.
+_ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+
+def _expand_env(text: str, path: str) -> str:
+    """Substitute environment references; an unset variable without a default is an error."""
+
+    def value(match: re.Match[str]) -> str:
+        name, default = match.group(1), match.group(2)
+        if name in os.environ:
+            return os.environ[name]
+        if default is None:
+            raise ConfigError(
+                f"{path!r}: environment variable {name} is not set and has no default"
+            )
+        return default
+
+    return _ENV_REFERENCE.sub(value, text)
 
 
 def load_robot_config(path: str) -> RobotConfig:
@@ -122,6 +146,7 @@ def load_robot_config(path: str) -> RobotConfig:
         raw_text = Path(path).read_text()
     except OSError as exc:
         raise ConfigError(f"could not read rosboard robot config at {path!r}: {exc}") from exc
+    raw_text = _expand_env(raw_text, path)
     try:
         raw = yaml.safe_load(raw_text)
     except yaml.YAMLError as exc:
@@ -150,6 +175,15 @@ def load_robot_config(path: str) -> RobotConfig:
         raise ConfigError(f"{path!r}: record_topics must be a list of topic names")
     record_topics = tuple(dict.fromkeys(record_topics_raw))
 
+    command_hold_s = float(raw.get("command_hold_s", 0.0))
+    if not math.isfinite(command_hold_s) or command_hold_s < 0:
+        raise ConfigError(f"{path!r}: command_hold_s must be >= 0, got {command_hold_s!r}")
+    command_resend_hz = float(raw.get("command_resend_hz", 10.0))
+    if not math.isfinite(command_resend_hz) or command_resend_hz <= 0:
+        raise ConfigError(
+            f"{path!r}: command_resend_hz must be positive, got {command_resend_hz!r}"
+        )
+
     observations_raw = _require(raw, "observations", path)
     if not isinstance(observations_raw, list) or not observations_raw:
         raise ConfigError(f"{path!r}: observations must be a non-empty list")
@@ -169,6 +203,8 @@ def load_robot_config(path: str) -> RobotConfig:
         actions=actions,
         fresh_obs_timeout_s=fresh_obs_timeout_s,
         record_topics=record_topics,
+        command_hold_s=command_hold_s,
+        command_resend_hz=command_resend_hz,
     )
 
 
