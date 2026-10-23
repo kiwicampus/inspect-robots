@@ -62,6 +62,7 @@ Pass values as `-P key=value` arguments or as keyword arguments to
 | `send_target` | `false` | Send the scene's `Target.spec` as `extra["target"]` on every `infer`, so a goal set on the task (`-T goal_lat=... -T goal_lon=...`) reaches the server. Raises at `reset` if the scene has no target. |
 | `name` | `pi_server` | Policy name recorded in logs. |
 | `api_key_env` | `PI_SERVER_API_KEY` | The **name** of an environment variable holding the server's API key, never the literal key. `Authorization: Api-Key <value>` is sent on every connect, even if the variable is unset (some deployments sit behind a network-level gate with no per-request check); if the connection then fails, the error names `api_key_env` as a thing to check. |
+| `proxy_token_env` | `MODAL_PROXY_TOKEN` | The **name** of an environment variable holding a Modal proxy token, `wk-<id>.ws-<secret>`. Sent as `Modal-Key`/`Modal-Secret` only to `*.modal.run` URLs, for endpoints deployed with Modal proxy auth; a malformed token raises at construction, and a failed connect to a Modal URL without one names the variable. |
 | `connect_open_timeout_s` | `360.0` | Websocket handshake timeout, generous by default for a cold-starting serverless GPU container. |
 | `connect_max_retries` | `3` | Connection attempts before giving up, with exponential backoff. Not retried for a malformed `load` response or a timeout. |
 | `request_timeout_s` | `120.0` | Per-RPC (`load`/`infer`/`reset`) timeout. |

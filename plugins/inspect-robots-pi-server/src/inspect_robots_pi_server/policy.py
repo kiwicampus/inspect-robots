@@ -60,7 +60,7 @@ from inspect_robots import (
 )
 from inspect_robots.errors import ConfigError
 from inspect_robots.spaces import ControlMode, Frame, GripperKind, RotationRepr
-from inspect_robots_pi_server._client import PolicyClient
+from inspect_robots_pi_server._client import PolicyClient, is_modal_url
 from inspect_robots_pi_server._image import (
     jpeg_encode,
     load_image_file,
@@ -144,6 +144,7 @@ class PiServerPolicy:
         send_target: bool = False,
         name: str = "pi_server",
         api_key_env: str = "PI_SERVER_API_KEY",
+        proxy_token_env: str = "MODAL_PROXY_TOKEN",
         env: Mapping[str, str] | None = None,
         connect_open_timeout_s: float = 360.0,
         connect_max_retries: int = 3,
@@ -161,6 +162,8 @@ class PiServerPolicy:
         environ = dict(os.environ) if env is None else env
         self._api_key = environ.get(api_key_env, "")
         self._api_key_env = api_key_env
+        self._proxy_token = environ.get(proxy_token_env, "")
+        self._proxy_token_env = proxy_token_env
 
         self._cameras = _as_mapping(cameras, "cameras")
         # `{cameras key: image file}`: that camera is sent from the file (read
@@ -230,6 +233,7 @@ class PiServerPolicy:
             connect_open_timeout_s=connect_open_timeout_s,
             connect_max_retries=connect_max_retries,
             request_timeout_s=request_timeout_s,
+            proxy_token=self._proxy_token,
         )
         self._resolved_for_spec: PolicySpec | None = None
         self._state_wire_keys: dict[str, str] = {}
@@ -406,6 +410,11 @@ class PiServerPolicy:
                 raise ConnectionError(
                     f"{exc}\nNo API key was found in ${self._api_key_env}. If this server "
                     f"requires one, set ${self._api_key_env} or pass -P api_key_env=NAME."
+                ) from exc
+            if is_modal_url(self.server_url) and not self._proxy_token:
+                raise ConnectionError(
+                    f"{exc}\nNo Modal proxy token was found in ${self._proxy_token_env}. A Modal "
+                    f"endpoint deployed with proxy auth needs it (wk-<id>.ws-<secret>)."
                 ) from exc
             raise
         if spec is not self._resolved_for_spec:

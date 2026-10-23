@@ -642,6 +642,66 @@ def test_missing_api_key_fails_to_connect(stub_server: StubPiServer) -> None:
         server.stop()
 
 
+_MODAL_URL = "wss://ws--pi-policy-x-policyservice-serve.modal.run"
+_PROXY_TOKEN = "wk-abc.ws-def"
+
+
+def _captured_headers(monkeypatch: pytest.MonkeyPatch, url: str, env: dict[str, str]) -> dict:
+    """Headers the client's first connect attempt sends; the attempt itself is refused."""
+    seen: dict = {}
+
+    def fake_connect(_url: str, *, additional_headers: dict, **_kwargs: object) -> None:
+        seen.update(additional_headers)
+        raise OSError("refused")
+
+    monkeypatch.setattr("inspect_robots_pi_server._client.ws_connect", fake_connect)
+    policy = PiServerPolicy(
+        url=url, control_mode="base_velocity", action_dim=2, connect_max_retries=1, env=env
+    )
+    with pytest.raises(ConnectionError):
+        policy.reset(_SCENE)
+    return seen
+
+
+def test_proxy_token_sent_to_modal_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = {"PI_SERVER_API_KEY": "k", "MODAL_PROXY_TOKEN": _PROXY_TOKEN}
+    headers = _captured_headers(monkeypatch, _MODAL_URL, env)
+    expected = {"Authorization": "Api-Key k", "Modal-Key": "wk-abc", "Modal-Secret": "ws-def"}
+    assert headers == expected
+
+
+def test_proxy_token_never_sent_to_other_hosts(monkeypatch: pytest.MonkeyPatch) -> None:
+    env = {"PI_SERVER_API_KEY": "k", "MODAL_PROXY_TOKEN": _PROXY_TOKEN}
+    headers = _captured_headers(monkeypatch, "ws://modal.run.example.com:8000", env)
+    assert headers == {"Authorization": "Api-Key k"}
+
+
+def test_missing_proxy_token_is_named_for_modal_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "inspect_robots_pi_server._client.ws_connect",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("401")),
+    )
+    policy = PiServerPolicy(
+        url=_MODAL_URL,
+        control_mode="base_velocity",
+        action_dim=2,
+        connect_max_retries=1,
+        env={"PI_SERVER_API_KEY": "k"},
+    )
+    with pytest.raises(ConnectionError, match="MODAL_PROXY_TOKEN"):
+        policy.reset(_SCENE)
+
+
+def test_malformed_proxy_token_fails_at_construction() -> None:
+    with pytest.raises(ValueError, match=r"wk-<id>\.ws-<secret>"):
+        PiServerPolicy(
+            url=_MODAL_URL,
+            control_mode="base_velocity",
+            action_dim=2,
+            env={"MODAL_PROXY_TOKEN": "ak-abc.as-def"},
+        )
+
+
 # --------------------------------------------------------------------------
 # Compatibility with a real embodiment
 # --------------------------------------------------------------------------

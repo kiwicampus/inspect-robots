@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import time
+import urllib.parse
 from typing import TYPE_CHECKING, Any
 
 from websockets.exceptions import WebSocketException
@@ -33,6 +34,26 @@ if TYPE_CHECKING:
 
 _CONNECTION_ERRORS = (WebSocketException, OSError, EOFError)
 _MAX_FRAME_BYTES = 50 * 1024 * 1024
+_MODAL_HOST_SUFFIX = ".modal.run"
+
+
+def is_modal_url(url: str) -> bool:
+    """Whether ``url`` points at a Modal web endpoint."""
+    return (urllib.parse.urlparse(url).hostname or "").endswith(_MODAL_HOST_SUFFIX)
+
+
+def proxy_auth_headers(url: str, token: str) -> dict[str, str]:
+    """Modal proxy auth headers from a ``wk-<id>.ws-<secret>`` token, for Modal URLs only.
+
+    Scoped by host so the token never reaches another server. Empty without a token.
+    """
+    token = token.strip()
+    if not token or not is_modal_url(url):
+        return {}
+    token_id, _, token_secret = token.partition(".")
+    if not token_id.startswith("wk-") or not token_secret.startswith("ws-"):
+        raise ValueError("a Modal proxy token must look like wk-<id>.ws-<secret>")
+    return {"Modal-Key": token_id, "Modal-Secret": token_secret}
 
 
 class PolicyClient:
@@ -46,9 +67,11 @@ class PolicyClient:
         connect_open_timeout_s: float = 360.0,
         connect_max_retries: int = 3,
         request_timeout_s: float = 120.0,
+        proxy_token: str = "",
     ) -> None:
         self.url = url
         self.api_key = api_key
+        self._proxy_headers = proxy_auth_headers(url, proxy_token)
         self.connect_open_timeout_s = connect_open_timeout_s
         self.connect_max_retries = max(1, connect_max_retries)
         self.request_timeout_s = request_timeout_s
@@ -74,7 +97,10 @@ class PolicyClient:
             try:
                 self._ws = ws_connect(
                     self.url,
-                    additional_headers={"Authorization": f"Api-Key {self.api_key}"},
+                    additional_headers={
+                        "Authorization": f"Api-Key {self.api_key}",
+                        **self._proxy_headers,
+                    },
                     max_size=_MAX_FRAME_BYTES,
                     compression=None,
                     open_timeout=self.connect_open_timeout_s,
