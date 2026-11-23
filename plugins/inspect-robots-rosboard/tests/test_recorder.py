@@ -208,7 +208,7 @@ def test_config_mode_records_the_clamped_command(tmp_path: Path) -> None:
     embodiment.step(Action(data=np.asarray([5.0, -0.5])))
     record = TrialRecord(scene_id="s0", epoch=0, seed=0)
     embodiment.on_trial_end(record, str(tmp_path), "run1")
-    rows = _rows(tmp_path / record.metadata["telemetry"])
+    rows = [r for r in _rows(tmp_path / record.metadata["telemetry"]) if r.get("kind") != "obs"]
     assert rows[-2]["action"] == [2.0, -0.5] and rows[-2]["published"] is True
     assert rows[-1]["t"] is None  # the trial ended mid command, so it was stopped
 
@@ -220,3 +220,57 @@ def test_recorded_topics_are_subscribed_once() -> None:
     embodiment._recorder = TopicRecorder(["/odometry/local", "/fix"], clock)
     embodiment._subscribe_recorded(embodiment._all_topics())
     assert subscribed == ["/fix"]
+
+
+def test_recorder_writes_input_ages(tmp_path: Path) -> None:
+    recorder = TopicRecorder([], lambda: 10.0)
+    path = tmp_path / "trial.jsonl"
+    recorder.start(path, {})
+    ages = {"/fix": {"rx": 0.1, "sensor": 0.3, "seq": 4, "repeated": False}}
+    recorder.observation(2, 10.5, ages, -7.0)
+    recorder.stop()
+    recorder.observation(3, 11.0, ages, -7.0)  # after stop: ignored
+    assert _rows(path)[1:] == [
+        {"kind": "obs", "t": 2, "stamp": 0.5, "clock_offset": -7.0, "ages": ages}
+    ]
+
+
+def test_clock_offset_keeps_the_smallest_link_delay(tmp_path: Path) -> None:
+    from test_config import _ready_config_embodiment
+
+    embodiment, _client, _clock = _ready_config_embodiment(tmp_path)
+    stamped = {"header": {"stamp": {"sec": 100, "nanosec": 0}}}
+    embodiment._track_clock_offset("/a", {}, 5.0)  # no header: ignored
+    assert embodiment._clock_offset is None
+    embodiment._track_clock_offset("/a", stamped, 5.5)
+    embodiment._track_clock_offset("/b", stamped, 5.2)
+    embodiment._track_clock_offset("/a", stamped, 6.0)
+    assert embodiment._clock_offset == pytest.approx(-94.8)
+
+
+def test_config_mode_records_each_steps_input_ages(tmp_path: Path) -> None:
+    from test_config import _ready_config_embodiment
+
+    embodiment, client, clock = _ready_config_embodiment(tmp_path)
+    odometry = dict(client.samples["/odometry/local"].payload)
+    odometry["header"] = {"stamp": {"sec": 1000, "nanosec": 0}}
+    client.put("/odometry/local", odometry)
+    embodiment._clock_offset = clock.now - 1000.2  # the fastest message took 0.2 s less
+    embodiment._recorder = TopicRecorder([], clock)
+    embodiment.on_trial_start("s0", 0, str(tmp_path), "run1")
+    embodiment.reset(_SCENE)
+    clock.now += 0.5  # the step only waits for odometry, so the camera frame stays the same
+    embodiment.step(Action(data=np.asarray([0.1, 0.0])))
+    record = TrialRecord(scene_id="s0", epoch=0, seed=0)
+    embodiment.on_trial_end(record, str(tmp_path), "run1")
+
+    obs = [r for r in _rows(tmp_path / record.metadata["telemetry"]) if r.get("kind") == "obs"]
+    assert [r["t"] for r in obs] == [0, 1]
+    first = obs[0]["ages"]
+    assert first["/odometry/local"]["sensor"] == pytest.approx(0.2)
+    assert first["/camera/color/image_raw"]["sensor"] is None  # no header in the fake frame
+    assert not first["/odometry/local"]["repeated"]
+    last = obs[1]["ages"]
+    assert last["/odometry/local"]["repeated"] is False  # waited for a new sample
+    assert last["/camera/color/image_raw"]["repeated"] is True  # same frame as before
+    assert last["/camera/color/image_raw"]["rx"] >= 0.5

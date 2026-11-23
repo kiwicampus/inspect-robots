@@ -270,11 +270,11 @@ def _image_payload(image: Any, image_format: str = "JPEG") -> dict[str, Any]:
 
 
 def _ready_config_embodiment(
-    tmp_path: Path,
+    tmp_path: Path, text: str = _MINIMAL_CONFIG
 ) -> tuple[RosboardEmbodiment, _FakeClient, _FakeClock]:
     fake_clock = _FakeClock()
     embodiment = RosboardEmbodiment(
-        config=_write_config(tmp_path), clock=fake_clock, sleep=fake_clock.sleep
+        config=_write_config(tmp_path, text), clock=fake_clock, sleep=fake_clock.sleep
     )
     client = _FakeClient(fake_clock)
     image = np.zeros((2, 3, 3), dtype=np.uint8)
@@ -472,3 +472,74 @@ def test_config_end_to_end_against_stub_server(
             for f in frames
         )
     )
+
+
+_FRESH_BOTH = _MINIMAL_CONFIG.replace(
+    "rate_hz: 10.0",
+    "rate_hz: 10.0\nfresh_obs_topics: [/odometry/local, /camera/color/image_raw, /odometry/local]",
+)
+
+
+def test_fresh_obs_topics_parse_and_dedupe(tmp_path: Path) -> None:
+    config = load_robot_config(_write_config(tmp_path, _FRESH_BOTH))
+    assert config.fresh_obs_topics == ("/odometry/local", "/camera/color/image_raw")
+    assert load_robot_config(_write_config(tmp_path)).fresh_obs_topics == ()
+
+
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [("/fix", "must be a list"), ("[/fix]", r"fresh_obs_topics \['/fix'\] are not observation")],
+)
+def test_fresh_obs_topics_rejects_bad_values(tmp_path: Path, value: str, match: str) -> None:
+    text = _MINIMAL_CONFIG.replace("rate_hz: 10.0", f"rate_hz: 10.0\nfresh_obs_topics: {value}")
+    with pytest.raises(ConfigError, match=match):
+        load_robot_config(_write_config(tmp_path, text))
+
+
+def test_config_step_waits_for_every_fresh_obs_topic(tmp_path: Path) -> None:
+    embodiment, client, _clock = _ready_config_embodiment(tmp_path, _FRESH_BOTH)
+    embodiment.reset(_SCENE)
+    waited: list[str] = []
+    refresh = client.on_wait
+    assert refresh is not None
+
+    def record(topic: str, after_seq: int) -> None:
+        waited.append(topic)
+        refresh(topic, after_seq)
+
+    client.on_wait = record
+    embodiment.step(Action(data=np.array([0.1, 0.0])))
+    assert waited == ["/odometry/local", "/camera/color/image_raw"]
+
+
+def test_config_step_without_fresh_obs_topics_waits_only_for_the_first_state_topic(
+    tmp_path: Path,
+) -> None:
+    embodiment, client, _clock = _ready_config_embodiment(tmp_path)
+    embodiment.reset(_SCENE)
+    waited: list[str] = []
+    refresh = client.on_wait
+    assert refresh is not None
+
+    def record(topic: str, after_seq: int) -> None:
+        waited.append(topic)
+        refresh(topic, after_seq)
+
+    client.on_wait = record
+    embodiment.step(Action(data=np.array([0.1, 0.0])))
+    assert waited == ["/odometry/local"]
+
+
+def test_config_step_names_the_fresh_topic_that_never_arrived(tmp_path: Path) -> None:
+    embodiment, client, _clock = _ready_config_embodiment(tmp_path, _FRESH_BOTH)
+    embodiment.reset(_SCENE)
+    refresh = client.on_wait
+    assert refresh is not None
+
+    def odometry_only(topic: str, after_seq: int) -> None:
+        if topic == "/odometry/local":
+            refresh(topic, after_seq)
+
+    client.on_wait = odometry_only
+    with pytest.raises(TimeoutError, match="no post-publish sample on '/camera/color/image_raw'"):
+        embodiment.step(Action(data=np.array([0.1, 0.0])))

@@ -23,7 +23,7 @@ def _trim(value: Any) -> Any:
     return value
 
 
-def _header_stamp(payload: dict[str, Any]) -> float | None:
+def header_stamp(payload: dict[str, Any]) -> float | None:
     """The message's own ``header.stamp`` in seconds, when it has one."""
     stamp = (payload.get("header") or {}).get("stamp") or {}
     if "sec" not in stamp:
@@ -75,7 +75,7 @@ class TopicRecorder:
             {
                 "topic": topic,
                 "stamp": round(stamp - self._t0, 4),
-                "header_stamp": _header_stamp(payload),
+                "header_stamp": header_stamp(payload),
                 "msg": _trim(payload),
             }
         )
@@ -93,6 +93,26 @@ class TopicRecorder:
                 "stamp": round(stamp - self._t0, 4),
                 "action": [float(v) for v in values],
                 "published": published,
+            }
+        )
+
+    def observation(
+        self, t: int, stamp: float, ages: dict[str, dict[str, Any]], clock_offset: float | None
+    ) -> None:
+        """Record how old each input of step ``t`` was when the observation was assembled.
+
+        ``clock_offset`` is the smallest receive time minus header stamp seen so far, so
+        ``sensor`` ages count from the robot's stamp, net of the fastest link delay.
+        """
+        if self._file is None:
+            return
+        self._write(
+            {
+                "kind": "obs",
+                "t": t,
+                "stamp": round(stamp - self._t0, 4),
+                "clock_offset": clock_offset,
+                "ages": ages,
             }
         )
 

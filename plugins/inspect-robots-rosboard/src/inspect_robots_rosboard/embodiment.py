@@ -83,7 +83,8 @@ from inspect_robots_rosboard._msgs import (
     parse_imu,
     parse_odometry,
 )
-from inspect_robots_rosboard._recorder import TopicRecorder
+from inspect_robots_rosboard._recorder import TopicRecorder, header_stamp
+from inspect_robots_rosboard._ros_bridge import DEFAULT_BAG_EXCLUDE, RosbagRecorder, RosBridge
 from inspect_robots_rosboard._selectors import build_from_selector, select_state
 from inspect_robots_rosboard._topics_file import TopicsFile, load_topics_file
 
@@ -113,6 +114,10 @@ class RosboardEmbodiment(EmbodimentBase):
     _recorder: TopicRecorder | None = None
     # Config mode with command_hold_s > 0: keeps each step's command alive until it is that old.
     _hold: CommandHold | None = None
+    # Config mode with ros_bridge on: local ROS 2 republisher, viz topics, a bag per trial.
+    _bridge: RosBridge | None = None
+    _bag: RosbagRecorder | None = None
+    _viz_topics: tuple[str, ...] = ()
     _step_index = 0
     _stop_sent = True  # no command since the last stop
 
@@ -397,7 +402,11 @@ class RosboardEmbodiment(EmbodimentBase):
         self._publish_stop()
         if self._recorder is not None:
             self._recorder.stop()
+        if self._bag is not None:
+            self._bag.stop()
         self._client.close()
+        if self._bridge is not None:
+            self._bridge.close()
 
     def connect_operator_session(self, session: Any) -> None:
         """Hand stdin to the core operator console, so Esc, /stop and /y /n /p end a trial.
@@ -455,11 +464,16 @@ class RosboardEmbodiment(EmbodimentBase):
             self._recorder.event("hold_end", stamp)
 
     def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
-        """Open ``<log_dir>/telemetry/<run_id>/<scene>-e<epoch>.jsonl`` if topics are recorded."""
-        if self._recorder is None:
-            return
+        """Open the trial's telemetry JSONL and start its rosbag, both under ``<run_id>/<trial>``.
+
+        Paths: ``<log_dir>/telemetry/<run_id>/<trial>.jsonl``, ``<log_dir>/bags/<run_id>/<trial>``.
+        """
         trial = f"{scene_id}-e{epoch}"
         safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in trial)
+        if self._bag is not None:
+            self._bag.start(Path(log_dir) / "bags" / run_id / safe)
+        if self._recorder is None:
+            return
         header: dict[str, Any] = {
             "run_id": run_id,
             "trial": trial,
@@ -478,12 +492,15 @@ class RosboardEmbodiment(EmbodimentBase):
         del run_id
         if not self._stop_sent:
             self._publish_stop()
-        path = self._recorder.stop() if self._recorder is not None else None
-        if path is None:
-            return
-        with suppress(ValueError):
-            path = path.resolve().relative_to(Path(log_dir).resolve())
-        record.metadata["telemetry"] = str(path)
+        for key, path in (
+            ("telemetry", self._recorder.stop() if self._recorder is not None else None),
+            ("rosbag", self._bag.stop() if self._bag is not None else None),
+        ):
+            if path is None:
+                continue
+            with suppress(ValueError):
+                path = path.resolve().relative_to(Path(log_dir).resolve())
+            record.metadata[key] = str(path)
 
     def _setup_recorder(
         self, topics: tuple[str, ...], topics_cfg: TopicsFile | None, topics_file: str | None
@@ -503,11 +520,32 @@ class RosboardEmbodiment(EmbodimentBase):
         self._client.add_listener(self._recorder.on_sample)
 
     def _subscribe_recorded(self, already: tuple[str, ...]) -> None:
-        if self._recorder is None:
-            return
-        for topic in self._recorder.topics:
+        """Subscribe recorded and viz topics that no observation already brings in."""
+        recorded = self._recorder.topics if self._recorder is not None else ()
+        for topic in dict.fromkeys((*recorded, *self._viz_topics)):
             if topic not in already:
                 self._client.subscribe(topic)
+
+    def _setup_ros_bridge(
+        self, robot_config: RobotConfig, topics_cfg: TopicsFile | None, topics_file: str | None
+    ) -> None:
+        spec = robot_config.ros_bridge
+        if not spec.enabled:
+            return
+        viz_topics = spec.viz_topics if spec.viz else ()
+        if topics_cfg is not None:
+            missing = [topic for topic in viz_topics if topic not in topics_cfg.topics]
+            if missing:
+                raise ValueError(
+                    f"topics_file {topics_file!r} does not list ros_bridge.viz_topics "
+                    f"{missing!r} under 'topics:'; add them there to subscribe to them"
+                )
+        self._bridge = RosBridge(command_prefix=spec.command_prefix, notice=self._notice)
+        self._client.add_listener(self._bridge.on_sample)
+        self._client.add_publish_listener(self._bridge.on_command)
+        self._viz_topics = viz_topics
+        if spec.bag:
+            self._bag = RosbagRecorder(exclude=spec.bag_exclude or DEFAULT_BAG_EXCLUDE)
 
     def _record_command(self, stamp: float, values: Sequence[float], published: bool) -> None:
         if self._recorder is not None:
@@ -737,9 +775,13 @@ class RosboardEmbodiment(EmbodimentBase):
         self._client = RosboardClient(
             url, connect_timeout_s=connect_timeout_s, clock=clock, sleep=sleep
         )
+        self._clock_offset: float | None = None
+        self._last_obs_seq: dict[str, int] = {}
+        self._client.add_listener(self._track_clock_offset)
         self._setup_recorder(
             _parse_topics(record_topics) or robot_config.record_topics, topics_cfg, topics_file
         )
+        self._setup_ros_bridge(robot_config, topics_cfg, topics_file)
         self._action_publish_enabled = action_publish_enabled
         self._robot_config = robot_config
         if robot_config.command_hold_s > 0:
@@ -772,7 +814,7 @@ class RosboardEmbodiment(EmbodimentBase):
         topics = self._all_topics_config()
         sequences = {topic: self._client.sequence(topic) for topic in topics}
         self._wait_for_sequences(sequences, self.obs_timeout_s, "obs_timeout_s")
-        observation = self._assemble_observation_config()
+        observation = self._assemble_observation_config(0)
         self._last_publish_time = None
         self._step_index = 0
         self._reset_count += 1
@@ -792,8 +834,7 @@ class RosboardEmbodiment(EmbodimentBase):
             if remaining > 0:
                 self._sleep(remaining)
 
-        reference_spec = self._freshness_reference_spec()
-        seq_at_publish = self._client.sequence(reference_spec.topic)
+        seqs_at_publish = {topic: self._client.sequence(topic) for topic in self._fresh_topics()}
         if self._hold is not None:
             self._hold.disarm()
         publish_time = self._clock()
@@ -827,19 +868,21 @@ class RosboardEmbodiment(EmbodimentBase):
         if self._hold is not None:
             self._hold.arm(held, self._zero_frames(), publish_time)
 
-        try:
-            self._client.wait_for_sample(
-                reference_spec.topic, after_seq=seq_at_publish, timeout_s=self.fresh_obs_timeout_s
-            )
-        except TimeoutError as exc:
-            raise TimeoutError(
-                f"no post-publish sample on {reference_spec.topic!r} within "
-                f"fresh_obs_timeout_s={self.fresh_obs_timeout_s:g}s at control_hz="
-                f"{self.control_hz:g}; lower control_hz or raise fresh_obs_timeout_s"
-            ) from exc
+        deadline = publish_time + self.fresh_obs_timeout_s
+        for topic, seq_at_publish in seqs_at_publish.items():
+            try:
+                self._client.wait_for_sample(
+                    topic, after_seq=seq_at_publish, timeout_s=max(deadline - self._clock(), 0.0)
+                )
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"no post-publish sample on {topic!r} within "
+                    f"fresh_obs_timeout_s={self.fresh_obs_timeout_s:g}s at control_hz="
+                    f"{self.control_hz:g}; lower control_hz or raise fresh_obs_timeout_s"
+                ) from exc
 
         return StepResult(
-            observation=self._assemble_observation_config(),
+            observation=self._assemble_observation_config(self._step_index),
             reward=None,
             terminated=False,
             truncated=False,
@@ -867,6 +910,43 @@ class RosboardEmbodiment(EmbodimentBase):
         assert self._robot_config is not None
         return tuple(spec.topic for spec in self._robot_config.observations)
 
+    def _fresh_topics(self) -> tuple[str, ...]:
+        """Topics that must each deliver a new sample after a publish before the next step."""
+        assert self._robot_config is not None
+        if self._robot_config.fresh_obs_topics:
+            return self._robot_config.fresh_obs_topics
+        return (self._freshness_reference_spec().topic,)
+
+    def _track_clock_offset(self, topic: str, payload: dict[str, Any], stamp: float) -> None:
+        """Client listener: keep the smallest receive time minus robot header stamp seen."""
+        del topic
+        robot_stamp = header_stamp(payload)
+        if robot_stamp is not None and (
+            self._clock_offset is None or stamp - robot_stamp < self._clock_offset
+        ):
+            self._clock_offset = stamp - robot_stamp
+
+    def _record_input_ages(self, t: int, now: float, samples: dict[str, TopicSample]) -> None:
+        """Telemetry row with each input topic's age since receipt and since its robot stamp."""
+        ages: dict[str, dict[str, Any]] = {}
+        for topic, sample in samples.items():
+            robot_stamp = header_stamp(sample.payload)
+            offset = self._clock_offset
+            sensor = (
+                None
+                if robot_stamp is None or offset is None
+                else round(now - robot_stamp - offset, 4)
+            )
+            ages[topic] = {
+                "rx": round(now - sample.stamp, 4),
+                "sensor": sensor,
+                "seq": sample.seq,
+                "repeated": self._last_obs_seq.get(topic) == sample.seq,
+            }
+            self._last_obs_seq[topic] = sample.seq
+        if self._recorder is not None:
+            self._recorder.observation(t, now, ages, self._clock_offset)
+
     def _freshness_reference_spec(self) -> ObservationSpec:
         """Pick the topic whose freshness proves a published action had an effect.
 
@@ -881,16 +961,18 @@ class RosboardEmbodiment(EmbodimentBase):
                 return spec
         return self._robot_config.observations[0]
 
-    def _assemble_observation_config(self) -> Observation:
+    def _assemble_observation_config(self, t: int) -> Observation:
+        """The latest sample of every observation topic, as the input to step ``t``."""
         assert self._robot_config is not None
         now = self._clock()
         images: dict[str, Any] = {}
         state: dict[str, Any] = {}
         image_times: dict[str, float] = {}
         state_times: list[float] = []
+        samples: dict[str, TopicSample] = {}
 
         for spec in self._robot_config.observations:
-            sample = self._required_sample(spec.topic)
+            sample = samples.setdefault(spec.topic, self._required_sample(spec.topic))
             self._check_staleness_ms(spec, sample, now)
             if spec.image is not None:
                 images[spec.key] = parse_compressed_image(
@@ -902,6 +984,7 @@ class RosboardEmbodiment(EmbodimentBase):
                 state[spec.key] = select_state(sample.payload, spec.selector_names)
                 state_times.append(sample.stamp)
 
+        self._record_input_ages(t, now, samples)
         return Observation(
             images=images,
             state=state,

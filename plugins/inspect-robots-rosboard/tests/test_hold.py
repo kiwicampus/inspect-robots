@@ -208,7 +208,7 @@ def test_embodiment_holds_each_command_and_logs_its_end(tmp_path: Path) -> None:
 
     rows = [json.loads(line) for line in (tmp_path / "telemetry/run1/s0-e0.jsonl").open()]
     assert rows[0]["command_hold_s"] == 0.35 and rows[0]["command_resend_hz"] == 10.0
-    assert [row["kind"] for row in rows if row.get("kind") != "header"] == [
+    assert [row["kind"] for row in rows if row.get("kind") not in ("header", "obs")] == [
         "command",
         "hold_end",
         "command",

@@ -101,6 +101,20 @@ class ActionSpec:
 
 
 @dataclass(frozen=True)
+class RosBridgeSpec:
+    """The ``ros_bridge:`` block: republish into local ROS 2, extra viz topics, a rosbag."""
+
+    enabled: bool = False
+    # When set, ``viz_topics`` are also subscribed on the eval's connection.
+    viz: bool = False
+    viz_topics: tuple[str, ...] = ()
+    # Commands sent to the robot are mirrored locally as ``<command_prefix><topic>``.
+    command_prefix: str = "/eval"
+    bag: bool = False
+    bag_exclude: str | None = None
+
+
+@dataclass(frozen=True)
 class RobotConfig:
     """A fully parsed and validated robot-config YAML file."""
 
@@ -112,14 +126,20 @@ class RobotConfig:
     # state topic; None means the default, 2 / rate_hz. Raise it when the
     # topic itself is fast but the websocket link has occasional delays.
     fresh_obs_timeout_s: float | None = None
+    # Observation topics that must each deliver a new sample after every publish; empty
+    # means only the first state topic, which proves the link is alive but not each input.
+    fresh_obs_topics: tuple[str, ...] = ()
     # Topics whose every sample is written to a per trial telemetry JSONL (read only).
     record_topics: tuple[str, ...] = ()
     # Seconds each command is resent after its step (0 = sent once), then zeros go out once.
     command_hold_s: float = 0.0
     command_resend_hz: float = 10.0
+    ros_bridge: RosBridgeSpec = RosBridgeSpec()
 
 
 _SUPPORTED_SAFETY_BEHAVIORS = frozenset({"zeros"})
+_TRUE = frozenset({"1", "true", "yes", "on"})
+_FALSE = frozenset({"0", "false", "no", "off"})
 # ``${NAME}`` or ``${NAME:-default}`` anywhere in the file, replaced before YAML parsing.
 _ENV_REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
@@ -168,6 +188,13 @@ def load_robot_config(path: str) -> RobotConfig:
                 f"{path!r}: fresh_obs_timeout_s must be positive, got {fresh_obs_timeout_s!r}"
             )
 
+    fresh_obs_topics_raw = raw.get("fresh_obs_topics") or []
+    if not isinstance(fresh_obs_topics_raw, list) or not all(
+        isinstance(topic, str) and topic for topic in fresh_obs_topics_raw
+    ):
+        raise ConfigError(f"{path!r}: fresh_obs_topics must be a list of topic names")
+    fresh_obs_topics = tuple(dict.fromkeys(fresh_obs_topics_raw))
+
     record_topics_raw = raw.get("record_topics") or []
     if not isinstance(record_topics_raw, list) or not all(
         isinstance(topic, str) and topic for topic in record_topics_raw
@@ -195,6 +222,9 @@ def load_robot_config(path: str) -> RobotConfig:
         raise ConfigError(f"{path!r}: actions must be a non-empty list")
     actions = tuple(_parse_action(entry, path) for entry in actions_raw)
     _require_unique_keys(actions, path, "actions")
+    unknown = [t for t in fresh_obs_topics if t not in {o.topic for o in observations}]
+    if unknown:
+        raise ConfigError(f"{path!r}: fresh_obs_topics {unknown!r} are not observation topics")
 
     return RobotConfig(
         name=name,
@@ -202,9 +232,49 @@ def load_robot_config(path: str) -> RobotConfig:
         observations=observations,
         actions=actions,
         fresh_obs_timeout_s=fresh_obs_timeout_s,
+        fresh_obs_topics=fresh_obs_topics,
         record_topics=record_topics,
         command_hold_s=command_hold_s,
         command_resend_hz=command_resend_hz,
+        ros_bridge=_parse_ros_bridge(raw.get("ros_bridge"), path),
+    )
+
+
+def _as_bool(value: Any, path: str, field_name: str) -> bool:
+    """YAML booleans, 0/1, and the strings an env var expands to; an empty value is false."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str) and value.strip().lower() in _TRUE | _FALSE | {""}:
+        return value.strip().lower() in _TRUE
+    raise ConfigError(f"{path!r}: {field_name} must be a boolean or 0/1, got {value!r}")
+
+
+def _parse_ros_bridge(raw: Any, path: str) -> RosBridgeSpec:
+    if raw is None:
+        return RosBridgeSpec()
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{path!r}: ros_bridge must be a mapping")
+    viz_topics = raw.get("viz_topics") or []
+    if not isinstance(viz_topics, list) or not all(isinstance(t, str) and t for t in viz_topics):
+        raise ConfigError(f"{path!r}: ros_bridge.viz_topics must be a list of topic names")
+    prefix = raw.get("command_prefix", "/eval")
+    if not isinstance(prefix, str) or not prefix.startswith("/"):
+        raise ConfigError(f"{path!r}: ros_bridge.command_prefix must start with '/'")
+    exclude = raw.get("bag_exclude")
+    if exclude is not None and not isinstance(exclude, str):
+        raise ConfigError(f"{path!r}: ros_bridge.bag_exclude must be a regex string")
+    enabled = _as_bool(raw.get("enabled", True), path, "ros_bridge.enabled")
+    return RosBridgeSpec(
+        enabled=enabled,
+        viz=enabled and _as_bool(raw.get("viz", False), path, "ros_bridge.viz"),
+        viz_topics=tuple(dict.fromkeys(viz_topics)),
+        command_prefix=prefix,
+        bag=enabled and _as_bool(raw.get("bag", False), path, "ros_bridge.bag"),
+        bag_exclude=exclude,
     )
 
 

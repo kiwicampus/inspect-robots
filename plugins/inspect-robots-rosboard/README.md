@@ -165,9 +165,16 @@ inspect-robots run --task my-task --policy scripted --embodiment rosboard \
 name: rover_diff_drive
 rate_hz: 10.0
 # fresh_obs_timeout_s: 2.0   # optional; default 2 / rate_hz (see Troubleshooting)
+# fresh_obs_topics: [/odometry/local, /camera/color/image_raw]   # optional; default: first state topic
 # record_topics: [/odometry/local, /fix]   # optional; per trial telemetry JSONL, read only
 # command_hold_s: ${HOLD_TIME:-0.7}   # optional; resend each command until this old, then zeros once
 # command_resend_hz: 10.0   # optional; resend rate while a command is held
+# ros_bridge:   # optional; needs rclpy and rclpy_message_converter (source ROS 2)
+#   enabled: ${EVAL_ROS_BRIDGE:-1}   # republish every received sample into local ROS 2
+#   viz: ${EVAL_RVIZ:-0}   # also subscribe viz_topics on the same connection
+#   viz_topics: [/tf, /tf_static, /local_costmap/costmap]
+#   command_prefix: /eval   # commands sent are mirrored as <prefix><topic>
+#   bag: ${EVAL_ROSBAG:-1}   # ros2 bag record -a for each trial
 
 observations:
   - key: observation.image.main
@@ -243,8 +250,17 @@ actions:
   `recording`** (top level) are accepted, for compatibility with config files
   shared across other tooling, but this adapter reads only `name` (echoed
   into `EmbodimentInfo.docs`), `rate_hz` and the optional
-  `fresh_obs_timeout_s`, `record_topics`, `command_hold_s` and
-  `command_resend_hz`; the rest are ignored.
+  `fresh_obs_timeout_s`, `fresh_obs_topics`, `record_topics`, `command_hold_s`,
+  `command_resend_hz` and `ros_bridge`; the rest are ignored.
+- **`fresh_obs_topics`** (default: the first state topic only): after every
+  publish, `step()` waits until each listed observation topic delivers a new
+  sample, all within `fresh_obs_timeout_s`. The default proves the link is
+  alive but lets a stalled camera repeat its last frame; list the camera and
+  every other input the policy must see fresh. With `record_topics` set,
+  telemetry gets an `obs` row per step: each input's age since receipt
+  (`rx`), its age since the robot's `header.stamp` net of the fastest link
+  delay seen (`sensor`, null without a header), its sequence number, and
+  whether the policy already saw that sample (`repeated`).
 - **`command_hold_s`** (default 0, off): a controller that zeroes its
   reference after a short timeout sees each step's command as a brief pulse
   when the policy is slower than that timeout. With a hold, the embodiment
@@ -253,6 +269,18 @@ actions:
   `safety_behavior: zeros`). A new step, a stop or `close()` ends the hold
   first. Telemetry gets a `hold_end` row at each expiry, and its header
   records both values. Dry run actions are never held.
+- **`ros_bridge`** (default off): republishes every sample this connection
+  receives on a local ROS 2 node, so RViz and `ros2 bag` see the robot without a
+  second rosboard connection. A worker thread publishes the newest sample per
+  topic, so conversion never delays observations. Images go out as the JPEG
+  rosboard sent, as `sensor_msgs/CompressedImage` on `<topic>/compressed`;
+  occupancy grids are restored from rosboard's PNG subsampling. Every command
+  sent (steps, held resends, stops) is mirrored on `<command_prefix><topic>`.
+  With `viz` on, `viz_topics` are subscribed too; with `topics_file`, they must
+  be listed under `topics:`. With `bag` on, each trial runs
+  `ros2 bag record -a` (mcap, zstd) into `<log_dir>/bags/<run>/<trial>`, stops
+  it with SIGINT at trial end, and stores the path as `rosbag` in the trial's
+  metadata. Empty values (an unset `${VAR:-}`) count as off.
 - **Environment variables:** `${NAME}` or `${NAME:-default}` anywhere in the
   config file is replaced before parsing, so a value can change per run
   without editing the file. An unset variable without a default is an error.

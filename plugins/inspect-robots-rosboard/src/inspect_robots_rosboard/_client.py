@@ -90,6 +90,7 @@ class RosboardClient:
         self._subscriptions: set[str] = set()
         self._latched_error: Exception | None = None
         self._listeners: list[Callable[[str, dict[str, Any], float], None]] = []
+        self._publish_listeners: list[Callable[[str, str, Mapping[str, Any]], None]] = []
         self._closing = False
         self._closed = False
 
@@ -150,6 +151,16 @@ class RosboardClient:
     def publish(self, topic: str, topic_type: str, fields: Mapping[str, Any]) -> None:
         """Publish one command message, surfacing any previously latched error first."""
         self._send(publish(topic, topic_type, fields))
+        with self._lock:
+            listeners = tuple(self._publish_listeners)
+        for listener in listeners:
+            with suppress(Exception):
+                listener(topic, topic_type, fields)
+
+    def add_publish_listener(self, listener: Callable[[str, str, Mapping[str, Any]], None]) -> None:
+        """Call ``listener(topic, type, fields)`` after every successfully sent command."""
+        with self._lock:
+            self._publish_listeners.append(listener)
 
     def add_listener(self, listener: Callable[[str, dict[str, Any], float], None]) -> None:
         """Call ``listener(topic, payload, stamp)`` on the receive thread for every message.

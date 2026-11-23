@@ -58,6 +58,10 @@ known-first-party = ["inspect_robots", "inspect_robots_rosboard"]
 [tool.mypy]
 strict = true
 
+[[tool.mypy.overrides]]
+module = ["rclpy", "rclpy.*", "rclpy_message_converter.*"]
+ignore_missing_imports = true
+
 [tool.hatch.metadata.hooks.fancy-pypi-readme]
 content-type = "text/markdown"
 
