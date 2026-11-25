@@ -53,11 +53,14 @@ from inspect_robots.scene import Scene, Target
 from inspect_robots.scorer import (
     Score,
     Scorer,
+    distance_to_goal,
     episode_length,
     is_affirmative_verdict,
     min_distance_to_goal,
     operator_scorer,
     reached_goal_state,
+    sct,
+    spl,
     success_at_end,
 )
 from inspect_robots.session import OperatorSession
@@ -118,6 +121,7 @@ __all__ = [
     "TrialRecord",
     "__version__",
     "defaults",
+    "distance_to_goal",
     "embodiment",
     "episode_length",
     "eval",
@@ -135,7 +139,9 @@ __all__ = [
     "registered",
     "resolve",
     "scorer",
+    "sct",
     "sink",
+    "spl",
     "success_at_end",
     "task",
     "vlm_grader",

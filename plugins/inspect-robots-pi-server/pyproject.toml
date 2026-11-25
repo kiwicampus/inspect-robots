@@ -1,0 +1,102 @@
+[build-system]
+requires = ["hatchling>=1.18", "hatch-fancy-pypi-readme>=24.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "inspect-robots-pi-server"
+version = "0.1.0"
+description = "PI-protocol policy adapter for Inspect Robots: evaluate a checkpoint served over the pi_inference_client websocket protocol (e.g. a policy_server/Modal deployment) with Inspect Robots."
+dynamic = ["readme"]
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Inspect Robots contributors" }]
+keywords = ["robotics", "pi-protocol", "policy-server", "vla", "inspect_robots", "evaluation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# NOTE: `pi_inference_client` itself is intentionally NOT a dependency. It is
+# not published on PyPI (vendored in a separate checkout) and this adapter's
+# whole point is not requiring a private client checkout on the eval machine.
+# The wire protocol (2-tuple msgpack-over-websocket framing, the NumPy codec,
+# image resize/encode) is reimplemented directly from the protocol contract,
+# the same "speak the protocol, don't import the vendor package" doctrine
+# inspect-robots-xpolicylab and inspect-robots-ros already apply.
+#
+# No msgpack-numpy dependency either: its wire format is not confirmed
+# byte-identical to pi_inference_client's own in-package codec, and this
+# protocol is security-sensitive (arbitrary dtype/shape from the wire), so
+# the codec here is a direct, diffable port instead.
+dependencies = [
+    "inspect-robots>=0.2",
+    "numpy>=1.24",
+    "websockets>=12",
+    "msgpack>=1.0",
+    "pillow>=10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-cov>=5.0", "mypy>=1.11", "ruff>=0.6"]
+
+[project.entry-points."inspect_robots.policies"]
+pi_server = "inspect_robots_pi_server:pi_server_policy"
+
+[project.urls]
+Homepage = "https://github.com/robocurve/inspect-robots/tree/main/plugins/inspect-robots-pi-server"
+Repository = "https://github.com/robocurve/inspect-robots"
+
+[tool.uv.sources]
+inspect-robots = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/inspect_robots_pi_server"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/inspect_robots_pi_server", "tests", "README.md"]
+
+[tool.ruff]
+extend = "../../pyproject.toml"
+
+[tool.ruff.lint.isort]
+known-first-party = ["inspect_robots", "inspect_robots_pi_server"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D1"]
+
+[tool.mypy]
+strict = true
+
+# msgpack ships no type stubs.
+[[tool.mypy.overrides]]
+module = ["msgpack.*"]
+ignore_missing_imports = true
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!NOTE\][ \t]*$'
+replacement = '> **Note:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!TIP\][ \t]*$'
+replacement = '> **Tip:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!IMPORTANT\][ \t]*$'
+replacement = '> **Important:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!WARNING\][ \t]*$'
+replacement = '> **Warning:**'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '(?m)^> \[!CAUTION\][ \t]*$'
+replacement = '> **Caution:**'

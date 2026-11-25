@@ -1456,6 +1456,49 @@ def test_on_trial_end_hook_error_on_already_errored_trial(tmp_path: Path) -> Non
     assert "hook exploded" in scene.error
 
 
+def test_embodiment_trial_hooks_run_after_the_policys_and_write_metadata(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+
+    class _HookPolicy(ScriptedPolicy):
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            events.append("policy start")
+
+        def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
+            events.append("policy end")
+
+    class _HookEmbodiment(CubePickEmbodiment):
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            events.append(f"embodiment start {scene_id} {epoch} {log_dir == str(tmp_path)}")
+
+        def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
+            events.append("embodiment end")
+            record.metadata["telemetry"] = f"telemetry/{run_id}/x.jsonl"
+
+    (log,) = eval(_task(), _HookPolicy(), _HookEmbodiment(), log_dir=str(tmp_path))
+
+    assert events == ["policy start", "embodiment start s0 0 True", "policy end", "embodiment end"]
+    assert log.samples[0].trial_metadata[0]["telemetry"].endswith("/x.jsonl")
+
+
+def test_raising_embodiment_start_hook_still_ends_the_started_policy(tmp_path: Path) -> None:
+    ends: list[int] = []
+
+    class _EndPolicy(ScriptedPolicy):
+        def on_trial_end(self, record: TrialRecord, log_dir: str, run_id: str) -> None:
+            ends.append(record.epoch)
+
+    class _BadEmbodiment(CubePickEmbodiment):
+        def on_trial_start(self, scene_id: str, epoch: int, log_dir: str, run_id: str) -> None:
+            raise RuntimeError("no disk")
+
+    (log,) = eval(_task(), _EndPolicy(), _BadEmbodiment(), log_dir=str(tmp_path))
+
+    assert log.samples[0].error == "embodiment.on_trial_start failed: no disk"
+    assert ends == [0]
+
+
 def test_policy_transcripts_parallel_scored_and_errored_epochs(tmp_path: Path) -> None:
     class _TranscriptBoomOnSecondEpoch(_BoomOnSecondEpochPolicy):
         def transcript(self) -> object:

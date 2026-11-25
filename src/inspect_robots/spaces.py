@@ -28,6 +28,7 @@ ControlMode = Literal[
     "eef_delta_pose",
     "eef_abs_pose",
     "eef_delta_pos",
+    "base_velocity",
 ]
 RotationRepr = Literal[
     "none",
